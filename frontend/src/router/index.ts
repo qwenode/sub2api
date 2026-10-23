@@ -951,6 +951,7 @@ router.beforeEach(async (to, _from, next) => {
     const restrictedPaths = [
       '/admin/subscriptions',
       '/admin/redeem',
+      '/admin/announcements',
       '/subscriptions',
       '/redeem'
     ]

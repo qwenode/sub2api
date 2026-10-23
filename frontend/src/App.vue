@@ -58,10 +58,19 @@ watch(
   { deep: true }
 )
 
+function announcementsEnabled() {
+  return authStore.isAuthenticated && !authStore.isSimpleMode
+}
+
+function loadAnnouncements(force = false) {
+  if (!announcementsEnabled()) return
+  announcementStore.fetchAnnouncements(force)
+}
+
 // Watch for authentication state and manage subscription data + announcements
 function onVisibilityChange() {
-  if (document.visibilityState === 'visible' && authStore.isAuthenticated) {
-    announcementStore.fetchAnnouncements()
+  if (document.visibilityState === 'visible') {
+    loadAnnouncements()
   }
 }
 
@@ -108,10 +117,10 @@ watch(
       // Announcements: new login vs page refresh restore
       if (oldValue === false) {
         // New login: delay 3s then force fetch
-        setTimeout(() => announcementStore.fetchAnnouncements(true), 3000)
+        setTimeout(() => loadAnnouncements(true), 3000)
       } else {
         // Page refresh restore (oldValue was undefined)
-        announcementStore.fetchAnnouncements()
+        loadAnnouncements()
       }
 
       // Register visibility change listener
@@ -127,11 +136,20 @@ watch(
   { immediate: true }
 )
 
+watch(
+  () => authStore.isSimpleMode,
+  (simple) => {
+    if (simple) {
+      announcementStore.reset()
+      return
+    }
+    loadAnnouncements()
+  }
+)
+
 // Route change trigger (throttled by store)
 router.afterEach(() => {
-  if (authStore.isAuthenticated) {
-    announcementStore.fetchAnnouncements()
-  }
+  loadAnnouncements()
 })
 
 onBeforeUnmount(() => {
@@ -165,6 +183,6 @@ onMounted(async () => {
   <NavigationProgress />
   <RouterView />
   <Toast />
-  <AnnouncementPopup />
+  <AnnouncementPopup v-if="!authStore.isSimpleMode" />
   <AdminComplianceDialog />
 </template>

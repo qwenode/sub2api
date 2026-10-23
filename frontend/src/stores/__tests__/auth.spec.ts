@@ -153,8 +153,10 @@ describe('useAuthStore', () => {
       expect(store.isAuthenticated).toBe(false)
       expect(localStorage.getItem('auth_token')).toBeNull()
       expect(localStorage.getItem('auth_user')).toBeNull()
+      expect(localStorage.getItem('auth_run_mode')).toBeNull()
       expect(localStorage.getItem('refresh_token')).toBeNull()
       expect(localStorage.getItem('token_expires_at')).toBeNull()
+      expect(store.isSimpleMode).toBe(false)
     })
   })
 
@@ -380,11 +382,24 @@ describe('useAuthStore', () => {
       await store.login({ email: 'test@example.com', password: '123456' })
 
       expect(store.isSimpleMode).toBe(true)
+      expect(localStorage.getItem('auth_run_mode')).toBe('simple')
     })
 
     it('默认为 standard 模式', () => {
       const store = useAuthStore()
       expect(store.isSimpleMode).toBe(false)
+    })
+
+    it('checkAuth 从 localStorage 恢复 run_mode', () => {
+      localStorage.setItem('auth_token', 'saved-token')
+      localStorage.setItem('auth_user', JSON.stringify(fakeUser))
+      localStorage.setItem('auth_run_mode', 'simple')
+      mockGetCurrentUser.mockResolvedValue({ data: fakeUser })
+
+      const store = useAuthStore()
+      store.checkAuth()
+
+      expect(store.isSimpleMode).toBe(true)
     })
   })
 })

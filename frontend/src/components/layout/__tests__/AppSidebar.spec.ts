@@ -63,6 +63,12 @@ describe('AppSidebar header styles', () => {
   })
 })
 
+describe('AppSidebar simple mode', () => {
+  it('hides the admin announcements entry in simple mode', () => {
+    expect(componentSource).toMatch(/path: '\/admin\/announcements'[^\n]*hideInSimpleMode: true/)
+  })
+})
+
 describe('AppSidebar subscription feature flag', () => {
   it('gates the My Subscriptions entry behind the subscription public-settings flag', () => {
     expect(componentSource).toContain('const flagSubscription = makeSidebarFlag(FeatureFlags.subscription)')
