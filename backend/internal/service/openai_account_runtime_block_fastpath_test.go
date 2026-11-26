@@ -120,6 +120,7 @@ func TestOpenAI429FastPath_BlocksOAuthImmediatelyWhenSevenDayQuotaIsExhausted(t 
 	rateLimits.SetAccountRuntimeBlocker(svc)
 	account := &Account{ID: 423, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
 	headers := http.Header{}
+	headers.Set("x-codex-credits-has-credits", "false")
 	headers.Set("x-codex-primary-used-percent", "100")
 	headers.Set("x-codex-primary-reset-after-seconds", "604800")
 	headers.Set("x-codex-primary-window-minutes", "10080")
@@ -348,6 +349,7 @@ func TestOpenAIHTTP429StillUsesQuotaResetHeaders(t *testing.T) {
 	account := &Account{ID: 422, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
 	svc.openaiOAuth429RetryStartedAt.Store(account.ID, time.Now().Add(-openAIOAuth429RetryWindow-time.Second))
 	headers := http.Header{}
+	headers.Set("x-codex-credits-has-credits", "false")
 	headers.Set("x-codex-primary-used-percent", "100")
 	headers.Set("x-codex-primary-reset-after-seconds", "604800")
 	headers.Set("x-codex-primary-window-minutes", "10080")
@@ -394,8 +396,6 @@ func TestOpenAI429FastPath_OpenCodeGoUsageLimitUsesMessageResetDuration(t *testi
 	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
 }
 
-// TestOpenAI429FastPath_SkipsSparkShadow 外审第8轮 P1:spark 影子被选中后若 /responses 返回 429,
-// 不得按 global x-codex-* 信号写内存运行时熔断(否则 spark 被冷却到 global reset、单影子场景无可用账号)。
 func TestOpenAI429FastPath_SkipsSparkShadow(t *testing.T) {
 	svc := &OpenAIGatewayService{}
 	parentID := int64(800)
@@ -451,10 +451,6 @@ func TestOpenAIRuntimeBlocker_IgnoresNonOpenAIFromRateLimitService(t *testing.T)
 	require.False(t, gateway.isOpenAIAccountRuntimeBlocked(account))
 }
 
-// 自 #4547（issue 4527 第4点）起，临时不可调度规则命中已知模型时按模型隔离：
-// 只封 (账号, 模型) 对，不再账号级一刀切；未知模型仍走账号级兜底
-// （见 TestOpenAITempUnschedulable_UnknownModelKeepsAccountRuntimeBlock）。
-// 池模式规则仍然生效（issue 4470）：停止同账号重试并对命中模型设临时封锁。
 func TestOpenAIPoolModeTempRule_StopsSameAccountRetryAndIsolatesBlockToModel(t *testing.T) {
 	repo := &errorPolicyRepoStub{}
 	rateLimitService := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)

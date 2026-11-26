@@ -8,7 +8,6 @@ import (
 	"time"
 )
 
-// AccountSchedulingThresholdDecision captures the pure pause decision for one account.
 type AccountSchedulingThresholdDecision struct {
 	ShouldPause      bool
 	Platform         string
@@ -28,8 +27,6 @@ type accountSchedulingThresholdCandidate struct {
 
 const accountSchedulingThresholdCredentialKey = "account_scheduling_threshold"
 
-// EvaluateAccountSchedulingThreshold evaluates whether an account should be paused
-// based on the current per-platform scheduling threshold snapshot.
 func EvaluateAccountSchedulingThreshold(account *Account, thresholds map[string]int, now time.Time) AccountSchedulingThresholdDecision {
 	decision := AccountSchedulingThresholdDecision{}
 	if account == nil {
@@ -53,6 +50,9 @@ func EvaluateAccountSchedulingThreshold(account *Account, thresholds map[string]
 	var winner *accountSchedulingThresholdCandidate
 	switch decision.Platform {
 	case PlatformOpenAI:
+		if openAICodexCreditsStateForAccount(account, now) == OpenAICodexCreditsAvailable {
+			return decision
+		}
 		winner = pickLatestResetSchedulingCandidate(openAIThresholdCandidates(account, now), threshold, now)
 	case PlatformAnthropic:
 		winner = pickLatestResetSchedulingCandidate(anthropicThresholdCandidates(account), threshold, now)
@@ -222,8 +222,6 @@ func identityValuesConflict(left, right string) bool {
 	return left != "" && right != "" && !strings.EqualFold(left, right)
 }
 
-// firstStringValue returns the first non-empty string among the given map keys.
-// Used by OpenAI codex snapshot identity matching for scheduling thresholds.
 func firstStringValue(values map[string]any, keys ...string) string {
 	if len(values) == 0 {
 		return ""
@@ -326,19 +324,6 @@ func anthropicFableThresholdCandidate(account *Account) *accountSchedulingThresh
 	}
 }
 
-// NOTE: Gemini / Kiro / Antigravity are intentionally NOT threshold-pausing
-// platforms (see AllowedSchedulingThresholdPlatforms and the evaluator switch,
-// asserted by TestEvaluateAccountSchedulingThreshold_UnsupportedPlatformsDoNotPause).
-// Their former per-platform candidate readers were dead code — never reachable
-// from EvaluateAccountSchedulingThreshold — and have been removed to avoid the
-// false impression that configuring a threshold for them has any effect. The
-// kiro_sched_* / antigravity_sched_* extras are still written purely as
-// observability snapshots.
-
-// grokThresholdCandidates uses only header-projected
-// grok_sched_utilization / grok_sched_reset_at (rolling quota window, reset
-// capped at ~25h when written). Official billing 7d/30d windows are not used
-// for auto-pause here.
 func grokThresholdCandidates(account *Account) []*accountSchedulingThresholdCandidate {
 	if account == nil {
 		return nil
@@ -353,11 +338,6 @@ func grokThresholdCandidates(account *Account) []*accountSchedulingThresholdCand
 	}
 }
 
-// cnProviderThresholdCandidates 读取国产供应商 Coding Plan、OpenCode Go 与 Command Code
-// 账号的 5h / weekly（及月度）窗口用量快照（由 CNProviderQuotaService 写入 account.Extra，
-// 键形如 <provider>_5h_used_percent / <provider>_weekly_reset_at）。payg 账号无此快照，
-// 候选为空 → 不触发阈值停调（余额型走余额检测）。与 openai 的快照驱动停调一致：
-// 仅当用量超阈值且窗口尚未重置时才停调。
 func cnProviderThresholdCandidates(account *Account, provider string) []*accountSchedulingThresholdCandidate {
 	if account == nil || len(account.Extra) == 0 {
 		return nil
@@ -375,8 +355,6 @@ func cnProviderThresholdCandidates(account *Account, provider string) []*account
 	return candidates
 }
 
-// cnQuotaHasMonthlyWindow 报告供应商的额度快照是否含月度窗口（OpenCode Go、
-// Command Code 与 Kimi 新套餐）。
 func cnQuotaHasMonthlyWindow(provider string) bool {
 	switch provider {
 	case PlatformOpenCodeGo, PlatformCommandCode, PlatformKimi:

@@ -1,13 +1,3 @@
-// Package repository 实现数据访问层（Repository Pattern）。
-//
-// 该包提供了与数据库交互的所有操作，包括 CRUD、复杂查询和批量操作。
-// 采用 Repository 模式将数据访问逻辑与业务逻辑分离，便于测试和维护。
-//
-// 主要特性：
-//   - 使用 Ent ORM 进行类型安全的数据库操作
-//   - 对于复杂查询（如批量更新、聚合统计）使用原生 SQL
-//   - 提供统一的错误翻译机制，将数据库错误转换为业务错误
-//   - 支持软删除，所有查询自动过滤已删除记录
 package repository
 
 import (
@@ -35,20 +25,10 @@ import (
 	"entgo.io/ent/dialect/sql/sqljson"
 )
 
-// accountRepository 实现 service.AccountRepository 接口。
-// 提供 AI API 账户的完整数据访问功能。
-//
-// 设计说明：
-//   - client: Ent 客户端，用于类型安全的 ORM 操作
-//   - sql: 原生 SQL 执行器，用于复杂查询和批量操作
-//   - schedulerCache: 调度器缓存，用于在账号状态变更时同步快照
 type accountRepository struct {
-	client *dbent.Client // Ent ORM 客户端
-	sql    sqlExecutor   // 原生 SQL 执行接口
-	// schedulerCache 用于在账号状态变更时主动同步快照到缓存，
-	// 确保粘性会话能及时感知账号不可用状态。
-	// Used to proactively sync account snapshot to cache when status changes,
-	// ensuring sticky sessions can promptly detect unavailable accounts.
+	client *dbent.Client
+	sql    sqlExecutor
+
 	schedulerCache service.SchedulerCache
 }
 
@@ -65,11 +45,12 @@ var schedulerNeutralExtraKeyPrefixes = []string{
 }
 
 var schedulerNeutralExtraKeys = map[string]struct{}{
-	"codex_usage_updated_at":     {},
-	"codex_credits_snapshot":     {},
-	"codex_referral_snapshot":    {},
-	"grok_billing_snapshot":      {},
-	"session_window_utilization": {},
+	"codex_usage_updated_at":      {},
+	"codex_credits_snapshot":      {},
+	"codex_credits_refresh_state": {},
+	"codex_referral_snapshot":     {},
+	"grok_billing_snapshot":       {},
+	"session_window_utilization":  {},
 }
 
 const postgresParameterBatchSize = 50000
@@ -107,20 +88,14 @@ func stripCodexFingerprintSeedFromExtraUpdate(extra map[string]any) map[string]a
 	return stripped
 }
 
-// NewAccountRepository 创建账户仓储实例。
-// 这是对外暴露的构造函数，返回接口类型以便于依赖注入。
 func NewAccountRepository(client *dbent.Client, sqlDB *sql.DB, schedulerCache service.SchedulerCache) service.AccountRepository {
 	return newAccountRepositoryWithSQL(client, sqlDB, schedulerCache)
 }
 
-// NewAdminAccountRepository exposes the account repository's atomic duplication capability
-// as an explicit dependency of the admin service.
 func NewAdminAccountRepository(client *dbent.Client, sqlDB *sql.DB, schedulerCache service.SchedulerCache) service.AdminAccountRepository {
 	return newAccountRepositoryWithSQL(client, sqlDB, schedulerCache)
 }
 
-// newAccountRepositoryWithSQL 是内部构造函数，支持依赖注入 SQL 执行器。
-// 这种设计便于单元测试时注入 mock 对象。
 func newAccountRepositoryWithSQL(client *dbent.Client, sqlq sqlExecutor, schedulerCache service.SchedulerCache) *accountRepository {
 	return &accountRepository{client: client, sql: sqlq, schedulerCache: schedulerCache}
 }
@@ -208,8 +183,6 @@ func createAccountRecord(ctx context.Context, client *dbent.Client, account *ser
 	return nil
 }
 
-// CreateWithAccountGroups atomically persists an account, its exact per-group priorities,
-// and the scheduler outbox event used to publish the new routing snapshot.
 func (r *accountRepository) CreateWithAccountGroups(ctx context.Context, account *service.Account, groups []service.AccountGroup) error {
 	if account == nil {
 		return service.ErrAccountNilInput
@@ -224,7 +197,7 @@ func (r *accountRepository) CreateWithAccountGroups(ctx context.Context, account
 		defer func() { _ = tx.Rollback() }()
 		txClient = tx.Client()
 	} else {
-		// Reuse a caller-owned transaction when this repository is already transactional.
+
 		txClient = r.client
 	}
 	groupIDs := make([]int64, 0, len(groups))
@@ -290,7 +263,6 @@ func (r *accountRepository) GetByIDs(ctx context.Context, ids []int64) ([]*servi
 		return []*service.Account{}, nil
 	}
 
-	// De-duplicate while preserving order of first occurrence.
 	uniqueIDs := make([]int64, 0, len(ids))
 	seen := make(map[int64]struct{}, len(ids))
 	for _, id := range ids {
@@ -338,7 +310,6 @@ func (r *accountRepository) GetByIDs(ctx context.Context, ids []int64) ([]*servi
 			continue
 		}
 
-		// Prefer the preloaded proxy edge when available.
 		if entAcc.Edges.Proxy != nil {
 			out.Proxy = proxyEntityToService(entAcc.Edges.Proxy)
 		}
@@ -355,7 +326,6 @@ func (r *accountRepository) GetByIDs(ctx context.Context, ids []int64) ([]*servi
 		outByID[entAcc.ID] = out
 	}
 
-	// Preserve input order (first occurrence), and ignore missing IDs.
 	out := make([]*service.Account, 0, len(uniqueIDs))
 	for _, id := range uniqueIDs {
 		if _, ok := entByID[id]; !ok {
@@ -369,11 +339,6 @@ func (r *accountRepository) GetByIDs(ctx context.Context, ids []int64) ([]*servi
 	return out, nil
 }
 
-// ExistsByID 检查指定 ID 的账号是否存在。
-// 相比 GetByID，此方法性能更优，因为：
-//   - 使用 Exist() 方法生成 SELECT EXISTS 查询，只返回布尔值
-//   - 不加载完整的账号实体及其关联数据（Groups、Proxy 等）
-//   - 适用于删除前的存在性检查等只需判断有无的场景
 func (r *accountRepository) ExistsByID(ctx context.Context, id int64) (bool, error) {
 	exists, err := r.client.Account.Query().Where(dbaccount.IDEQ(id)).Exist(ctx)
 	if err != nil {
@@ -387,10 +352,6 @@ func (r *accountRepository) GetByCRSAccountID(ctx context.Context, crsAccountID 
 		return nil, nil
 	}
 
-	// 使用 sqljson.ValueEQ 生成 JSON 路径过滤，避免手写 SQL 片段导致语法兼容问题。
-	// 排除 spark 影子账号(parent_account_id 非空):影子不持凭据,绝不能被 CRS 当作普通账号
-	// 更新而覆盖 type/credentials/proxy。即便影子 Extra 被误写入 crs_account_id 也不会命中
-	// (外审第7轮 P1)。
 	m, err := r.client.Account.Query().
 		Where(dbaccount.ParentAccountIDIsNil()).
 		Where(func(s *entsql.Selector) {
@@ -415,8 +376,7 @@ func (r *accountRepository) GetByCRSAccountID(ctx context.Context, crsAccountID 
 }
 
 func (r *accountRepository) ListCRSAccountIDs(ctx context.Context) (map[string]int64, error) {
-	// parent_account_id IS NULL 排除 spark 影子账号:影子不是 CRS 账号,绝不能进 CRS 同步映射
-	// (否则会被当普通账号更新而覆盖 type/credentials/proxy)(外审第7轮 P1)。
+
 	rows, err := r.sql.QueryContext(ctx, `
 		SELECT id, extra->>'crs_account_id'
 		FROM accounts
@@ -452,9 +412,6 @@ func (r *accountRepository) Update(ctx context.Context, account *service.Account
 	return r.updateAccount(ctx, account, nil, nil, account.RateMultiplier)
 }
 
-// UpdateWithAccountBillingSettings applies an admin account edit while
-// preserving a concurrently probe-synchronized rate unless the request
-// explicitly includes a manual rate.
 func (r *accountRepository) UpdateWithAccountBillingSettings(
 	ctx context.Context,
 	account *service.Account,
@@ -516,8 +473,7 @@ func (r *accountRepository) updateAccount(
 	}
 
 	account.UpdatedAt = updated.UpdatedAt
-	// 普通账号编辑（如 model_mapping / credentials）也需要立即刷新单账号快照，
-	// 否则网关在 outbox worker 延迟或异常时仍可能读到旧配置。
+
 	if contextTx == nil {
 		r.syncSchedulerAccountSnapshot(baseCtx, account.ID)
 	}
@@ -781,10 +737,7 @@ func lockAndMergeAccountProbeExtra(
 			rateSyncEnabled = false
 			rateSyncEnabledPresent = true
 		}
-		// 同步依赖探测，方向是单向的：探测关闭（或探测键缺失）一律把同步归零。
-		// 不做反向推导——由 rate_sync=true 推出 probe=true 会让一条"同步开、探测键
-		// 缺失"的僵尸记录在任意一次无关编辑时静默打开周期性外呼。需要同时打开两个
-		// 开关的调用方（管理端编辑）自己显式传 explicitProbeEnabled=true。
+
 		if !probeEnabled {
 			rateSyncEnabled = false
 		}
@@ -823,11 +776,7 @@ func lockAndMergeAccountProbeExtra(
 			}
 		}
 	}
-	// OpenCode Go 受管状态与 Ollama 同范式：组身份（opencode_go Go 订阅，或挂载
-	// 白名单平台 + 官方 OpenCode Go 基址，且 api_key 不变）未变时从锁定的 DB 行
-	// 回填，客户端 DTO 脱敏或并发 refresh 写入都无法覆盖/丢失；身份改变或不再
-	// eligible 时既不回填，写出的 extra 即清除旧状态。
-	// 代理不属于组身份，但 snapshot 外呼与 CAS 经代理，故代理变化时快照失效而开关保留。
+
 	if service.IsOpenCodeGoUsageAccount(account) && opencodeGroupIdentityUnchanged {
 		if value, ok, err := decodeAccountExtraJSON(currentOpenCodeAutoRefresh); err != nil {
 			return nil, err
@@ -842,8 +791,7 @@ func lockAndMergeAccountProbeExtra(
 			}
 		}
 	}
-	// Grok 目录和能力 metadata 是同步写入的受管状态。普通更新在行锁内采用最新
-	// 数据库值，忽略表单旧值、缺键和注入。来源身份变化不删除已有成功快照。
+
 	for key, raw := range map[string][]byte{
 		"grok_observed_models":                currentGrokObservedModels,
 		service.UpstreamModelMetadataExtraKey: currentUpstreamModelMetadata,
@@ -996,7 +944,7 @@ func (r *accountRepository) Delete(ctx context.Context, id int64) error {
 	if err != nil {
 		return err
 	}
-	// 使用事务保证账号与关联分组的删除原子性
+
 	tx, err := r.client.Tx(ctx)
 	if err != nil && !errors.Is(err, dbent.ErrTxStarted) {
 		return err
@@ -1007,7 +955,7 @@ func (r *accountRepository) Delete(ctx context.Context, id int64) error {
 		defer func() { _ = tx.Rollback() }()
 		txClient = tx.Client()
 	} else {
-		// 已处于外部事务中（ErrTxStarted），复用当前 client
+
 		txClient = r.client
 	}
 
@@ -1135,10 +1083,7 @@ func (r *accountRepository) accountListFilteredQuery(platform, accountType, stat
 
 func (r *accountRepository) ListWithFilters(ctx context.Context, params pagination.PaginationParams, platform, accountType, status, search string, groupID int64, privacyMode string) ([]service.Account, *pagination.PaginationResult, error) {
 	q := r.accountListFilteredQuery(platform, accountType, status, search, groupID, privacyMode)
-	// Clone before Count so interceptor-appended predicates (SoftDeleteMixin's
-	// deleted_at IS NULL) don't accumulate on the shared builder and pollute the
-	// subsequent list query. Same pattern used in group_repo/promo_code_repo/user_repo
-	// (P1-03 audit fix, commit 2588fa6a).
+
 	total, err := q.Clone().Count(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -1330,20 +1275,6 @@ func (r *accountRepository) ListOAuthRefreshCandidatePage(ctx context.Context, o
 		return nil, errors.New("oauth refresh candidate page limit must be between 1 and 1000")
 	}
 
-	// (cond) IS NOT TRUE 把 NULL 和 FALSE 都视为"可被刷新"。直接写
-	// NOT (a AND b) 在 PG 三值逻辑下会把 a 或 b 为 NULL 的行（即绝大多数
-	// 健康账号：temp_unschedulable_until=NULL）也排除，导致后台 token
-	// 刷新工作器漏掉所有正常账号 → access_token 到期后请求开始 401。
-	//
-	// Deliberately NO `schedulable = TRUE` filter here: paused accounts
-	// (schedulable=false, status=active) still hold valid refresh tokens and
-	// their stored access_token must keep working for the admin usage-window
-	// probe. Excluding them lets the token silently expire, after which the
-	// dashboard reports a false "needs re-auth" even though Test Connection
-	// (which refreshes on demand) succeeds. Permanent rejection is already
-	// covered by the status = 'active' filter (error accounts drop out), and
-	// accounts whose refresh actually fails are rate-limited by the
-	// ExcludeRetryCooldown clause below.
 	query := `
 		SELECT id
 		FROM accounts
@@ -1478,8 +1409,6 @@ func (r *accountRepository) BatchUpdateLastUsed(ctx context.Context, updates map
 	caseSQL += " END, updated_at = NOW() WHERE id = ANY($" + itoa(idx) + ") AND deleted_at IS NULL"
 	args = append(args, pq.Array(ids))
 
-	// 同一事务内先按 id 升序锁定目标行再更新，与计费合并事务锁多个账号行的顺序一致；
-	// 锁强度与更新非键列相同，不阻塞引用 accounts 的外键检查。
 	exec := r.sql
 	var tx *sql.Tx
 	if db, ok := r.sql.(*sql.DB); ok {
@@ -1586,11 +1515,6 @@ func (r *accountRepository) SetGrokCredentialErrorIfMatch(
 	return true, nil
 }
 
-// SetGrokOAuthErrorIfCredentialsUnchanged atomically quarantines a structurally
-// invalid Grok OAuth account only if it is still active and its complete JSONB
-// credential document matches the state observed by reconciliation. Exact
-// JSONB equality includes _token_version when present and prevents a concurrent
-// reauthorization from being overwritten by a stale check-then-mutate path.
 func (r *accountRepository) SetGrokOAuthErrorIfCredentialsUnchanged(
 	ctx context.Context,
 	id int64,
@@ -1646,11 +1570,6 @@ func (r *accountRepository) SetGrokOAuthErrorIfCredentialsUnchanged(
 	return true, nil
 }
 
-// UpdateGrokOAuthCredentialsIfUnchanged persists provider-issued replacement
-// credentials only while the complete Grok OAuth credential document and
-// proxy still match the fresh snapshot used by the upstream refresh call. The
-// scheduler outbox insert is part of the same PostgreSQL statement, so a
-// durable invalidation failure rolls the credential update back as well.
 func (r *accountRepository) UpdateGrokOAuthCredentialsIfUnchanged(
 	ctx context.Context,
 	id int64,
@@ -1661,8 +1580,6 @@ func (r *accountRepository) UpdateGrokOAuthCredentialsIfUnchanged(
 	return r.updateOAuthCredentialsIfUnchanged(ctx, id, service.PlatformGrok, expectedCredentials, expectedProxyID, credentials)
 }
 
-// UpdateOpenAIOAuthCredentialsIfUnchanged preserves a completed token rotation
-// without overwriting concurrent reauthorization or writing to a credential shadow.
 func (r *accountRepository) UpdateOpenAIOAuthCredentialsIfUnchanged(
 	ctx context.Context,
 	id int64,
@@ -1731,10 +1648,6 @@ func (r *accountRepository) updateOAuthCredentialsIfUnchanged(
 	return true, nil
 }
 
-// SetGrokOAuthRefreshErrorIfCredentialsUnchanged is the background-refresh
-// counterpart to reconciliation's stricter missing-refresh-token mutation. It
-// matches the complete credential document used by the failed upstream attempt
-// but deliberately does not require the refresh token to be absent.
 func (r *accountRepository) SetGrokOAuthRefreshErrorIfCredentialsUnchanged(
 	ctx context.Context,
 	id int64,
@@ -1792,9 +1705,6 @@ func (r *accountRepository) SetGrokOAuthRefreshErrorIfCredentialsUnchanged(
 	return true, nil
 }
 
-// SetGrokOAuthRefreshTempUnschedulableIfCredentialsUnchanged applies a bounded
-// transient refresh quarantine only while the active Grok OAuth credential
-// document still matches the exact upstream attempt.
 func (r *accountRepository) SetGrokOAuthRefreshTempUnschedulableIfCredentialsUnchanged(
 	ctx context.Context,
 	id int64,
@@ -1853,14 +1763,6 @@ func (r *accountRepository) SetGrokOAuthRefreshTempUnschedulableIfCredentialsUnc
 	return true, nil
 }
 
-// syncSchedulerAccountSnapshot 在账号状态变更时主动同步快照到调度器缓存。
-// 当账号被设置为错误、禁用、不可调度或临时不可调度时调用，
-// 确保调度器和粘性会话逻辑能及时感知账号的最新状态，避免继续使用不可用账号。
-//
-// syncSchedulerAccountSnapshot proactively syncs account snapshot to scheduler cache
-// when account status changes. Called when account is set to error, disabled,
-// unschedulable, or temporarily unschedulable, ensuring scheduler and sticky session
-// logic can promptly detect the latest account state and avoid using unavailable accounts.
 func (r *accountRepository) syncSchedulerAccountSnapshot(ctx context.Context, accountID int64) {
 	if r == nil || r.schedulerCache == nil || accountID <= 0 {
 		return
@@ -2028,7 +1930,7 @@ func (r *accountRepository) BindGroups(ctx context.Context, accountID int64, gro
 	if err != nil {
 		return err
 	}
-	// 使用事务保证删除旧绑定与创建新绑定的原子性
+
 	tx, err := r.client.Tx(ctx)
 	if err != nil && !errors.Is(err, dbent.ErrTxStarted) {
 		return err
@@ -2039,7 +1941,7 @@ func (r *accountRepository) BindGroups(ctx context.Context, accountID int64, gro
 		defer func() { _ = tx.Rollback() }()
 		txClient = tx.Client()
 	} else {
-		// 已处于外部事务中（ErrTxStarted），复用当前 client
+
 		txClient = r.client
 	}
 	if err := lockLiveGroups(ctx, txClient, groupIDs); err != nil {
@@ -2242,7 +2144,7 @@ func (r *accountRepository) ListSchedulableByPlatform(ctx context.Context, platf
 }
 
 func (r *accountRepository) ListSchedulableByGroupIDAndPlatform(ctx context.Context, groupID int64, platform string) ([]service.Account, error) {
-	// 单平台查询复用多平台逻辑，保持过滤条件与排序策略一致。
+
 	return r.queryAccountsByGroup(ctx, groupID, accountGroupQueryOptions{
 		status:      service.StatusActive,
 		schedulable: true,
@@ -2254,8 +2156,7 @@ func (r *accountRepository) ListSchedulableByPlatforms(ctx context.Context, plat
 	if len(platforms) == 0 {
 		return nil, nil
 	}
-	// 仅返回可调度的活跃账号，并过滤处于过载/限流窗口的账号。
-	// 代理与分组信息统一在 accountsToService 中批量加载，避免 N+1 查询。
+
 	now := time.Now()
 	accounts, err := r.client.Account.Query().
 		Where(
@@ -2324,7 +2225,7 @@ func (r *accountRepository) ListSchedulableByGroupIDAndPlatforms(ctx context.Con
 	if len(platforms) == 0 {
 		return nil, nil
 	}
-	// 复用按分组查询逻辑，保证分组优先级 + 账号优先级的排序与筛选一致。
+
 	return r.queryAccountsByGroup(ctx, groupID, accountGroupQueryOptions{
 		status:      service.StatusActive,
 		schedulable: true,
@@ -2332,10 +2233,6 @@ func (r *accountRepository) ListSchedulableByGroupIDAndPlatforms(ctx context.Con
 	})
 }
 
-// ListModelAvailabilityCandidates returns the persistently configured account
-// pool used to decide whether a model is supported. Unlike scheduling queries,
-// it intentionally ignores transient runtime state (rate limits, overload,
-// temporary unschedulability, and expiry windows).
 func (r *accountRepository) ListModelAvailabilityCandidates(
 	ctx context.Context,
 	groupID *int64,
@@ -2389,9 +2286,6 @@ func (r *accountRepository) SetRateLimited(ctx context.Context, id int64, resetA
 	return nil
 }
 
-// SetRateLimitedIfLater atomically extends an account-level rate limit. Grok
-// requests may finish concurrently, so an older response must not overwrite a
-// later reset boundary observed by another request or instance.
 func (r *accountRepository) SetRateLimitedIfLater(ctx context.Context, id int64, resetAt time.Time) error {
 	now := time.Now()
 	updated, err := r.client.Account.Update().
@@ -2409,8 +2303,7 @@ func (r *accountRepository) SetRateLimitedIfLater(ctx context.Context, id int64,
 		return err
 	}
 	if updated == 0 {
-		// This instance may not have observed the later value written elsewhere.
-		// Refresh its local scheduler snapshot even though no outbox event is needed.
+
 		r.syncSchedulerAccountSnapshot(ctx, id)
 		return nil
 	}
@@ -2421,9 +2314,6 @@ func (r *accountRepository) SetRateLimitedIfLater(ctx context.Context, id int64,
 	return nil
 }
 
-// ClearRateLimitIfObserved clears exactly the Grok rate-limit generation seen
-// by a successful request. Matching both timestamps prevents a stale success
-// from erasing a later clear/re-arm generation with an equal or shorter reset.
 func (r *accountRepository) ClearRateLimitIfObserved(ctx context.Context, id int64, observedLimitedAt, observedResetAt time.Time) (bool, error) {
 	updated, err := r.client.Account.Update().
 		Where(
@@ -2450,19 +2340,6 @@ func (r *accountRepository) ClearRateLimitIfObserved(ctx context.Context, id int
 	return true, nil
 }
 
-// SetRateLimitedIfUnchanged atomically applies a rate-limit reset only while the
-// account still carries exactly the generation the caller observed: its
-// UpdatedAt row version, its RateLimitedAt and its RateLimitResetAt (nil means
-// that field is currently unset). It is the write-back CAS counterpart to
-// ClearRateLimitIfObserved: an async rate-limit reset (e.g. an Ollama Cloud
-// usage probe) must not overwrite a newer 429, an admin clear, a re-armed
-// generation, or a key/state change observed by another writer between the
-// caller's read and this write. The whole update is a single statement, so the
-// write itself is race-free. updated reports whether the write happened, and the
-// caller must ONLY send its scheduling notification when updated == true (this
-// method already performed the DB update; no further SetRateLimited call is
-// allowed, as a second unconditional write would reintroduce the race). No new
-// migration is required.
 func (r *accountRepository) SetRateLimitedIfUnchanged(
 	ctx context.Context,
 	id int64,
@@ -2492,9 +2369,7 @@ func (r *accountRepository) SetRateLimitedIfUnchanged(
 		return false, err
 	}
 	if updated == 0 {
-		// The generation changed concurrently (cleared, re-armed, or the account
-		// was otherwise updated elsewhere): do not announce anything, just
-		// refresh the local scheduler snapshot.
+
 		r.syncSchedulerAccountSnapshot(ctx, id)
 		return false, nil
 	}
@@ -2527,7 +2402,7 @@ func (r *accountRepository) SetModelRateLimit(ctx context.Context, id int64, sco
 	client := clientFromContext(ctx, r.client)
 	result, err := client.ExecContext(
 		ctx,
-		`UPDATE accounts SET 
+		`UPDATE accounts SET
 			extra = jsonb_set(
 				jsonb_set(COALESCE(extra, '{}'::jsonb), '{model_rate_limits}'::text[], COALESCE(extra->'model_rate_limits', '{}'::jsonb), true),
 				ARRAY['model_rate_limits', $1]::text[],
@@ -2742,9 +2617,6 @@ func (r *accountRepository) ClearModelRateLimits(ctx context.Context, id int64) 
 	return nil
 }
 
-// ClearModelRateLimit 删除 model_rate_limits 中指定的单个 scope。
-// 与 ClearModelRateLimits 的全量清除不同，这里只解封一个模型窗口，
-// 不会把其他模型或并发新写入的限流一起抹掉。
 func (r *accountRepository) ClearModelRateLimit(ctx context.Context, id int64, scope string) error {
 	if strings.TrimSpace(scope) == "" {
 		return nil
@@ -2799,7 +2671,7 @@ func (r *accountRepository) UpdateSessionWindow(ctx context.Context, id int64, s
 	if err != nil {
 		return err
 	}
-	// 触发调度器缓存更新（仅当窗口时间有变化时）
+
 	if start != nil || end != nil {
 		if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
 			logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue session window update failed: account=%d err=%v", id, err)
@@ -2809,8 +2681,7 @@ func (r *accountRepository) UpdateSessionWindow(ctx context.Context, id int64, s
 }
 
 func (r *accountRepository) UpdateSessionWindowEnd(ctx context.Context, id int64, end time.Time) error {
-	// Active five-hour quota reads must advance both bounds. Keeping the old
-	// start would charge the previous window against the new window's cost limit.
+
 	_, err := r.client.Account.Update().
 		Where(dbaccount.IDEQ(id)).
 		SetSessionWindowStart(end.Add(-5 * time.Hour)).
@@ -2877,7 +2748,7 @@ func (r *accountRepository) AutoPauseExpiredAccounts(ctx context.Context, now ti
 	}
 
 	if len(accountIDs) > 0 {
-		// 只刷新本次暂停的账号及其所属分组，避免少量账号到期触发所有调度桶重建。
+
 		payload := map[string]any{"account_ids": accountIDs}
 		if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountBulkChanged, nil, nil, payload); err != nil {
 			logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue auto pause account changes failed: err=%v", err)
@@ -2895,7 +2766,6 @@ func (r *accountRepository) UpdateExtra(ctx context.Context, id int64, updates m
 		return nil
 	}
 
-	// 使用 JSONB 合并操作实现原子更新，避免读-改-写的并发丢失更新问题
 	payload, err := json.Marshal(updates)
 	if err != nil {
 		return err
@@ -2920,6 +2790,9 @@ func (r *accountRepository) UpdateExtra(ctx context.Context, id int64, updates m
 		}
 	}
 	extraExpression := "COALESCE(extra, '{}'::jsonb) || $1::jsonb"
+	if _, ok := updates["codex_credits_snapshot"]; ok {
+		extraExpression = codexCreditsExtraMergeSQL()
+	}
 	if clearProbeSnapshot {
 		extraExpression = "(" + extraExpression + ") - 'upstream_billing_probe'"
 	}
@@ -2956,9 +2829,7 @@ func (r *accountRepository) UpdateExtra(ctx context.Context, id int64, updates m
 			r.syncSchedulerAccountSnapshot(baseCtx, id)
 		}
 	} else {
-		// 观测型 extra 字段不需要触发 bucket 重建，但仍同步单账号快照，
-		// 让 sticky session / GetAccount 命中缓存时也能读到最新数据，
-		// 同时避免缓存局部 patch 覆盖掉并发写入的其它账号字段。
+
 		if dbent.TxFromContext(ctx) == nil {
 			r.syncSchedulerAccountSnapshot(ctx, id)
 		}
@@ -2966,8 +2837,6 @@ func (r *accountRepository) UpdateExtra(ctx context.Context, id int64, updates m
 	return nil
 }
 
-// UpdateUpstreamBillingProbeSnapshot stores a probe result only while the
-// network identity used by that probe is still current.
 func (r *accountRepository) UpdateUpstreamBillingProbeSnapshot(
 	ctx context.Context,
 	account *service.Account,
@@ -2996,8 +2865,7 @@ func (r *accountRepository) UpdateUpstreamBillingProbeSnapshot(
 		if err := tx.Commit(); err != nil {
 			return err
 		}
-		// The durable outbox event is committed with the snapshot. This direct
-		// cache write only reduces visibility latency on the current instance.
+
 		r.syncSchedulerAccountSnapshot(ctx, account.ID)
 		return nil
 	}
@@ -3119,6 +2987,23 @@ func lockAndMatchProbeProxyIdentity(ctx context.Context, client *dbent.Client, a
 	return current == proxyProbeIdentityFromService(account.Proxy), rows.Err()
 }
 
+func codexCreditsExtraMergeSQL() string {
+	oldSnapshot := "(extra -> 'codex_credits_snapshot')"
+	newSnapshot := "($1::jsonb -> 'codex_credits_snapshot')"
+	observed := func(snapshot string) string {
+		return "(CASE WHEN " + snapshot + " ? 'observed_at_ms' THEN CASE WHEN " + snapshot + " ->> 'observed_at_ms' ~ '^[0-9]+$' THEN (" + snapshot + " ->> 'observed_at_ms')::numeric ELSE 0 END WHEN " + snapshot + " ->> 'fetched_at' ~ '^[0-9]+$' THEN (" + snapshot + " ->> 'fetched_at')::numeric * 1000 ELSE 0 END)"
+	}
+	available := func(snapshot string) string {
+		credits := "(" + snapshot + " -> 'credits')"
+		balance := "(" + credits + " ->> 'balance')"
+		positive := "CASE WHEN " + balance + " ~ '^[+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$' THEN " + balance + "::numeric > 0 ELSE FALSE END"
+		return "COALESCE((" + credits + " -> 'unlimited' = 'true'::jsonb OR (" + credits + " -> 'has_credits' = 'true'::jsonb AND (" + balance + " IS NULL OR " + positive + "))), FALSE)"
+	}
+	oldTime, newTime := observed(oldSnapshot), observed(newSnapshot)
+	accept := newTime + " > " + oldTime + " OR (" + newTime + " = " + oldTime + " AND (NOT " + available(newSnapshot) + " OR " + available(oldSnapshot) + "))"
+	return "COALESCE(extra, '{}'::jsonb) || ($1::jsonb - 'codex_credits_snapshot') || CASE WHEN " + accept + " THEN jsonb_build_object('codex_credits_snapshot', " + newSnapshot + ") ELSE '{}'::jsonb END"
+}
+
 func shouldEnqueueSchedulerOutboxForExtraUpdates(updates map[string]any) bool {
 	if len(updates) == 0 {
 		return false
@@ -3180,7 +3065,7 @@ func (r *accountRepository) BulkUpdate(ctx context.Context, ids []int64, updates
 		idx++
 	}
 	if updates.ProxyID != nil {
-		// 0 表示清除代理（前端发送 0 而不是 null 来表达清除意图）
+
 		if *updates.ProxyID == 0 {
 			setClauses = append(setClauses, "proxy_id = NULL")
 			ollamaProxyIdentityChanged = "proxy_id IS NOT NULL"
@@ -3232,7 +3117,7 @@ func (r *accountRepository) BulkUpdate(ctx context.Context, ids []int64, updates
 		}
 		updates.Extra[service.UpstreamBillingProbeEnabledExtraKey] = *updates.ProbeEnabled
 	}
-	// JSONB 需要合并而非覆盖，使用 raw SQL 保持旧行为。
+
 	credentialPlaceholder := ""
 	if len(updates.Credentials) > 0 {
 		payload, err := json.Marshal(updates.Credentials)
@@ -3255,15 +3140,9 @@ func (r *accountRepository) BulkUpdate(ctx context.Context, ids []int64, updates
 				" AND "+ollamaCloudBaseURLMatchesSQL(credentialPlaceholder+"::jsonb ->> 'base_url'")+")")
 	}
 
-	// OpenCode Go 身份清理与 Ollama 同范式但更精确：仅当旧行按新谓词属于 OpenCode
-	// 用量身份（opencode_go Go 订阅，或挂载白名单平台 + 官方 OpenCode Go 基址）时
-	// 才可能持有受管键，且只在该组身份（api_key / normalized base URL /
-	// account_mode）真正变化或不再 eligible 时清除，避免与 Ollama 分支交叉误清。
 	opencodeGroupIdentityChanges := make([]string, 0, 3)
 	opencodeOldBaseURL := opencodeGoBaseURLMatchSQLPrefix + "credentials ->> 'base_url'" + opencodeGoBaseURLMatchSQLSuffix
-	// 旧行 OpenCode 用量身份谓词（与 opencodeGoUsageEligibleSQL 的行侧条件镜像；
-	// type 由 opencodeEligibleAccount 统一携带）。account_mode 未设置/为 null/非
-	// zen 均视为 Go 订阅，与 GetOpenCodeAccountMode 默认兼容一致。
+
 	opencodeOldUsageIdentity := "((platform = 'opencode_go' AND COALESCE(btrim(credentials ->> 'account_mode') <> 'zen', true))" +
 		" OR (platform IN (" + opencodeGoUsageMountPlatformsSQL + ") AND " + opencodeOldBaseURL + "))"
 	if _, ok := updates.Credentials["api_key"]; ok {
@@ -3271,17 +3150,13 @@ func (r *accountRepository) BulkUpdate(ctx context.Context, ids []int64, updates
 			opencodeOldUsageIdentity+" AND credentials -> 'api_key' IS DISTINCT FROM "+credentialPlaceholder+"::jsonb -> 'api_key'")
 	}
 	if _, ok := updates.Credentials["base_url"]; ok {
-		// 仅挂载行身份钉在官方基址上（opencode_go 行的 base_url 不参与资格，两个
-		// 官方变体都合法，不由此子句清理）。NULL-safe：新 base_url 缺失/为 null 时
-		// regex(NULL) 为 NULL，NOT NULL 仍为 NULL 会令 WHEN 不命中而残留 OpenCode
-		// 状态；IS NOT TRUE 把 NULL 视为不匹配。
+
 		opencodeGroupIdentityChanges = append(opencodeGroupIdentityChanges,
 			"platform IN ("+opencodeGoUsageMountPlatformsSQL+") AND "+opencodeOldBaseURL+
 				" AND ("+opencodeGoBaseURLMatchSQLPrefix+credentialPlaceholder+"::jsonb ->> 'base_url'"+opencodeGoBaseURLMatchSQLSuffix+") IS NOT TRUE")
 	}
 	if _, ok := updates.Credentials["account_mode"]; ok {
-		// 仅 opencode_go 行身份钉在 Go 订阅上（挂载行的 account_mode 与 OpenCode
-		// 资格无关，不由此子句清理）。模式转 Zen 即不再 eligible。
+
 		opencodeGroupIdentityChanges = append(opencodeGroupIdentityChanges,
 			"platform = 'opencode_go' AND COALESCE(btrim(credentials ->> 'account_mode') <> 'zen', true)"+
 				" AND COALESCE(btrim("+credentialPlaceholder+"::jsonb ->> 'account_mode') <> 'zen', true) IS NOT TRUE")
@@ -3318,21 +3193,7 @@ func (r *accountRepository) BulkUpdate(ctx context.Context, ids []int64, updates
 				snapshotIdentityChanged = "(" + snapshotIdentityChanged + " OR " + proxyChanged + ")"
 			}
 		}
-		// 代理不属于 OpenCode 组身份，但 snapshot 外呼与 CAS 经代理：
-		// 组身份变化清除开关+快照，仅代理变化清除快照而保留开关。
-		// eligible 判定必须包含旧行 OpenCode 身份（opencode_go Go 订阅，或挂载
-		// 白名单平台 + opencode 基址）：否则白名单平台的 Ollama 行在代理变化时会
-		// 先命中 OpenCode 分支（CASE 按序求值）而遮蔽 Ollama 分支的快照清理。
-		// 注意 OpenCode 与 Ollama 两套分支的 WHEN 并不互斥：eligibleAccount 只看
-		// platform 白名单 + type='apikey'，根本不含 base_url，且与 OpenCode 挂载
-		// 白名单完全相同，因此挂载行（白名单平台 + 官方 OpenCode Go 基址）会同时
-		// 满足两套分支的 WHEN；互斥的只是两侧身份谓词（opencode.ai 基址正则 vs
-		// ollama.com 基址正则，host 不同）。因此下方 caseBranches 必须先拼 OpenCode
-		// 分支再拼 Ollama 分支——这是正确性要求而非防御：若 Ollama 分支在前，
-		// 挂载行的 api_key 变化会先命中 Ollama 分支，opencode_go_usage_snapshot /
-		// opencode_go_usage_auto_refresh 残留，陈旧快照跟着新 api_key 走，跨 key
-		// 组污染。反方向安全：Ollama 行（ollama.com 基址）不满足 OpenCode 身份
-		// 谓词；opencode_go 平台行不在 Ollama 白名单内，与 Ollama 分支真互斥。
+
 		opencodeEligibleAccount := "type = 'apikey' AND " + opencodeOldUsageIdentity
 		opencodeGroupIdentityChanged := ""
 		if len(opencodeGroupIdentityChanges) > 0 {
@@ -3459,14 +3320,13 @@ type accountGroupQueryOptions struct {
 	status               string
 	schedulable          bool
 	ignoreTransientState bool
-	platforms            []string // 允许的多个平台，空切片表示不进行平台过滤
+	platforms            []string
 }
 
 func (r *accountRepository) queryAccountsByGroup(ctx context.Context, groupID int64, opts accountGroupQueryOptions) ([]service.Account, error) {
 	q := r.client.AccountGroup.Query().
 		Where(dbaccountgroup.GroupIDEQ(groupID))
 
-	// 通过 account_groups 中间表查询账号，并按需叠加状态/平台/调度能力过滤。
 	preds := make([]dbpredicate.Account, 0, 6)
 	preds = append(preds, dbaccount.DeletedAtIsNil())
 	if opts.status != "" {
@@ -3760,10 +3620,6 @@ func mergeGroupIDs(a []int64, b []int64) []int64 {
 	return out
 }
 
-// buildSchedulerGroupPayload 构造 EventAccountChanged / EventAccountGroupsChanged
-// 事件的 payload。空 groupIDs 必须返回 untyped nil（any 而非 map[string]any(nil)），
-// 否则 enqueueSchedulerOutbox 的 "payload != nil" 接口判空会被 typed-nil 欺骗，
-// 把 payload marshal 成 "null" 写入 dedup_key 哈希，破坏与其他 nil-payload 调用的去重一致性。
 func buildSchedulerGroupPayload(groupIDs []int64) any {
 	if len(groupIDs) == 0 {
 		return nil
@@ -3846,11 +3702,6 @@ func itoa(v int) string {
 	return strconv.Itoa(v)
 }
 
-// FindByExtraField 根据 extra 字段中的键值对查找账号。
-// 使用 PostgreSQL JSONB @> 操作符进行高效查询（需要 GIN 索引支持）。
-//
-// FindByExtraField finds accounts by key-value pairs in the extra field.
-// Uses PostgreSQL JSONB @> operator for efficient queries (requires GIN index).
 func (r *accountRepository) FindByExtraField(ctx context.Context, key string, value any) ([]service.Account, error) {
 	accounts, err := r.client.Account.Query().
 		Where(
@@ -3900,15 +3751,6 @@ func (r *accountRepository) FindByExtraField(ctx context.Context, key string, va
 	return r.accountsToService(ctx, accounts)
 }
 
-// ListDueUpstreamBillingProbeAccounts bounds result hydration and network work
-// to limit. PostgreSQL must still filter and order all enabled candidates;
-// MATERIALIZED avoids repeating the defensive timestamp parse expression.
-// Go writes next_probe_at via RFC3339Nano (up to 9 fractional digits) while
-// jsonpath datetime() parses at most microseconds, so fractions beyond 6
-// digits are trimmed first — mirroring ListDueOllamaCloudUsageAccounts.
-// Without this, every nanosecond timestamp is treated as malformed and the
-// fail-open ordering pins the cycle to the lowest account IDs, starving the
-// rest of the pool.
 func (r *accountRepository) ListDueUpstreamBillingProbeAccounts(ctx context.Context, now time.Time, limit int) ([]service.Account, error) {
 	if limit <= 0 {
 		return []service.Account{}, nil
@@ -4010,11 +3852,8 @@ func (r *accountRepository) ListDueUpstreamBillingProbeAccounts(ctx context.Cont
 	return out, nil
 }
 
-// nowUTC is a SQL expression to generate a UTC RFC3339 timestamp string.
 const nowUTC = `to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`
 
-// dailyExpiredExpr is a SQL expression that evaluates to TRUE when daily quota period has expired.
-// Supports both rolling (24h from start) and fixed (pre-computed reset_at) modes.
 const dailyExpiredExpr = `(
 	CASE WHEN COALESCE(extra->>'quota_daily_reset_mode', 'rolling') = 'fixed'
 	THEN NOW() >= COALESCE((extra->>'quota_daily_reset_at')::timestamptz, '1970-01-01'::timestamptz)
@@ -4023,7 +3862,6 @@ const dailyExpiredExpr = `(
 	END
 )`
 
-// weeklyExpiredExpr is a SQL expression that evaluates to TRUE when weekly quota period has expired.
 const weeklyExpiredExpr = `(
 	CASE WHEN COALESCE(extra->>'quota_weekly_reset_mode', 'rolling') = 'fixed'
 	THEN NOW() >= COALESCE((extra->>'quota_weekly_reset_at')::timestamptz, '1970-01-01'::timestamptz)
@@ -4032,9 +3870,6 @@ const weeklyExpiredExpr = `(
 	END
 )`
 
-// nextDailyResetAtExpr is a SQL expression to compute the next daily reset_at when a reset occurs.
-// For fixed mode: computes the next future reset time based on NOW(), timezone, and configured hour.
-// This correctly handles long-inactive accounts by jumping directly to the next valid reset point.
 const nextDailyResetAtExpr = `(
 	CASE WHEN COALESCE(extra->>'quota_daily_reset_mode', 'rolling') = 'fixed'
 	THEN to_char((
@@ -4059,9 +3894,6 @@ const nextDailyResetAtExpr = `(
 	ELSE NULL END
 )`
 
-// nextWeeklyResetAtExpr is a SQL expression to compute the next weekly reset_at when a reset occurs.
-// For fixed mode: computes the next future reset time based on NOW(), timezone, configured day and hour.
-// This correctly handles long-inactive accounts by jumping directly to the next valid reset point.
 const nextWeeklyResetAtExpr = `(
 	CASE WHEN COALESCE(extra->>'quota_weekly_reset_mode', 'rolling') = 'fixed'
 	THEN to_char((
@@ -4100,9 +3932,6 @@ const nextWeeklyResetAtExpr = `(
 	ELSE NULL END
 )`
 
-// IncrementQuotaUsed 原子递增账号的配额用量（总/日/周三个维度）
-// 日/周额度在周期过期时自动重置为 0 再递增。
-// 支持滚动窗口（rolling）和固定时间（fixed）两种重置模式。
 func (r *accountRepository) IncrementQuotaUsed(ctx context.Context, id int64, amount float64) error {
 	rows, err := r.sql.QueryContext(ctx,
 		`UPDATE accounts SET extra = (
@@ -4164,7 +3993,6 @@ func (r *accountRepository) IncrementQuotaUsed(ctx context.Context, id int64, am
 		return err
 	}
 
-	// 任一维度配额刚超限时触发调度快照刷新
 	if limit > 0 && newUsed >= limit && (newUsed-amount) < limit {
 		if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
 			logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue quota exceeded failed: account=%d err=%v", id, err)
@@ -4173,8 +4001,6 @@ func (r *accountRepository) IncrementQuotaUsed(ctx context.Context, id int64, am
 	return nil
 }
 
-// ResetQuotaUsedAndClearRateLimitCooldown resets all quota dimensions and the
-// account-level cooldown in one statement. Other scheduler blocking state is preserved.
 func (r *accountRepository) ResetQuotaUsedAndClearRateLimitCooldown(ctx context.Context, id int64) error {
 	result, err := r.sql.ExecContext(ctx,
 		`UPDATE accounts SET extra = (
@@ -4194,7 +4020,7 @@ func (r *accountRepository) ResetQuotaUsedAndClearRateLimitCooldown(ctx context.
 	if affected == 0 {
 		return service.ErrAccountNotFound
 	}
-	// 重置配额后触发调度快照刷新，使账号重新参与调度
+
 	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
 		logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue quota reset failed: account=%d err=%v", id, err)
 	}
@@ -4202,11 +4028,8 @@ func (r *accountRepository) ResetQuotaUsedAndClearRateLimitCooldown(ctx context.
 	return nil
 }
 
-// RevertProxyFallback 将账号的 proxy_id 切回 proxy_fallback_origin_id，并清空 origin 字段。
-// 仅当 proxy_fallback_origin_id IS NOT NULL 时执行更新；
-// 若影响行数为 0，则返回 ErrAccountNotInFallback（账号存在但不在 fallback 状态）。
 func (r *accountRepository) RevertProxyFallback(ctx context.Context, accountID int64) error {
-	// Probe snapshots belong to the network identity; invalidate only on a real proxy change.
+
 	res, err := r.sql.ExecContext(ctx, `
 		UPDATE accounts SET
 			extra=CASE WHEN type='apikey' AND proxy_id IS DISTINCT FROM proxy_fallback_origin_id
@@ -4226,10 +4049,6 @@ func (r *accountRepository) RevertProxyFallback(ctx context.Context, accountID i
 	return nil
 }
 
-// ListShadowsByParent 返回指定父账号的影子账号；当前实现仅查 quota_dimension='spark'（唯一预设）。
-// 同时过滤 parent_account_id 和 quota_dimension='spark'，防止未来其它 linked 维度被误伤。
-// ⚠️ 新增影子维度时：须更新此函数（或新增维度专用列举），并检查所有调用点（级联删除/一母一影校验/type 守卫），否则会静默漏掉新维度。
-// 软删除行由 SoftDeleteMixin 拦截器自动排除，无需手写 deleted_at IS NULL。
 func (r *accountRepository) ListShadowsByParent(ctx context.Context, parentID int64) ([]*service.Account, error) {
 	if scoped := r.accountTransactionScope(ctx); scoped != r {
 		return scoped.ListShadowsByParent(ctx, parentID)

@@ -232,6 +232,10 @@ func (q *autoResetTestQuota) QueryUsage(context.Context, int64) (*OpenAIQuotaUsa
 	return &copy, nil
 }
 
+func (q *autoResetTestQuota) QueryCreditsUsage(ctx context.Context, id int64) (*OpenAIQuotaUsage, error) {
+	return q.QueryUsage(ctx, id)
+}
+
 func (q *autoResetTestQuota) CacheResetCreditsSnapshot(context.Context, int64, *OpenAIRateLimitResetCredits) error {
 	return nil
 }
@@ -379,7 +383,6 @@ func TestOpenAIQuotaAutoResetService_TimeoutRetryReusesRequestBody(t *testing.T)
 	require.Equal(t, args[0], args[1], "超时重试必须复用相同 credit_id 与 redeem_request_id")
 }
 
-// newResetThresholdTestFixture 构造一个 7d 用量已过用卡阈值、处于停调中的账号。
 func newResetThresholdTestFixture(t *testing.T, state *OpenAIAutoResetCreditState, availableCredits int) (*OpenAIQuotaAutoResetService, *autoResetTestAccountRepo, *autoResetTestQuota) {
 	t.Helper()
 	now := time.Now().UTC()

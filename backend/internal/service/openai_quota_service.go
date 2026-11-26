@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -16,14 +17,8 @@ import (
 	"github.com/imroc/req/v3"
 )
 
-// ErrSparkShadowResetNotSupported is returned when ResetCredit is called on a
-// spark shadow account. Shadow accounts do not hold credentials of their own;
-// the caller must reset the parent account directly. It is a structured
-// infraerrors value so the handler maps it to 409 Conflict (not a bare 500);
-// errors.Is still matches it by identity since ResetCredit returns this var.
 var ErrSparkShadowResetNotSupported = infraerrors.New(http.StatusConflict, "SPARK_SHADOW_RESET_NOT_SUPPORTED", "spark shadow account does not support credit reset; reset the parent account")
 
-// Endpoints used by the OpenAI/ChatGPT/Codex quota query and reset feature.
 const (
 	chatGPTUsageURL             = "https://chatgpt.com/backend-api/wham/usage"
 	chatGPTRateLimitCreditsURL  = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
@@ -39,9 +34,6 @@ const (
 	openaiQuotaCreditsKey       = "codex_credits_snapshot"
 )
 
-// OpenAIRateLimitWindow describes a single rate-limit window returned by
-// /wham/usage. The upstream returns an explicit `null` window when the slot
-// is unused, so consumers should treat a nil pointer as "no data".
 type OpenAIRateLimitWindow struct {
 	UsedPercent        float64 `json:"used_percent"`
 	LimitWindowSeconds int64   `json:"limit_window_seconds"`
@@ -49,7 +41,6 @@ type OpenAIRateLimitWindow struct {
 	ResetAt            int64   `json:"reset_at"`
 }
 
-// OpenAIRateLimit is a rate-limit envelope (primary + optional secondary window).
 type OpenAIRateLimit struct {
 	Allowed         bool                   `json:"allowed"`
 	LimitReached    bool                   `json:"limit_reached"`
@@ -57,44 +48,37 @@ type OpenAIRateLimit struct {
 	SecondaryWindow *OpenAIRateLimitWindow `json:"secondary_window,omitempty"`
 }
 
-// OpenAIAdditionalRateLimit describes a per-feature rate limit (e.g. Codex Spark).
 type OpenAIAdditionalRateLimit struct {
 	LimitName      string           `json:"limit_name"`
 	MeteredFeature string           `json:"metered_feature"`
 	RateLimit      *OpenAIRateLimit `json:"rate_limit,omitempty"`
 }
 
-// OpenAIRateLimitResetCreditDetail is the sanitized metadata surfaced for one
-// available reset credit. Do not add upstream ids or tokens here.
 type OpenAIRateLimitResetCreditDetail struct {
 	ExpiresAt string `json:"expires_at,omitempty"`
 }
 
-// OpenAIRateLimitResetCredits captures the "available_count" surfaced for the
-// rate_limit_reset_credit grant type, which the reset action consumes.
 type OpenAIRateLimitResetCredits struct {
 	AvailableCount int                                `json:"available_count"`
 	Credits        []OpenAIRateLimitResetCreditDetail `json:"credits,omitempty"`
 }
 
-// OpenAICredits is the spendable Codex credit balance from /wham/usage.
-// It is separate from reset credits. Upstream represents the balance as a
-// nullable decimal string; keep that representation to preserve precision.
-// Source: Codex 41ece455b7fa, codex-backend-openapi-models/src/models/credit_status_details.rs.
 type OpenAICredits struct {
-	HasCredits bool    `json:"has_credits"`
-	Unlimited  bool    `json:"unlimited"`
-	Balance    *string `json:"balance"`
+	HasCredits        bool    `json:"has_credits"`
+	Unlimited         bool    `json:"unlimited"`
+	Balance           *string `json:"balance"`
+	decoded           bool
+	hasCreditsPresent bool
+	invalid           bool
 }
 
 type openAICreditsSnapshot struct {
-	Credits   *OpenAICredits `json:"credits"`
-	FetchedAt int64          `json:"fetched_at"`
+	Credits           *OpenAICredits `json:"credits"`
+	FetchedAt         int64          `json:"fetched_at"`
+	ObservedAtMs      int64          `json:"observed_at_ms,omitempty"`
+	observedAtPresent bool
 }
 
-// OpenAIQuotaUsage is the typed projection of /wham/usage we expose to the UI.
-// Fields not relevant to the quota card are intentionally omitted to keep the
-// surface narrow; full upstream payload preservation is unnecessary.
 type OpenAIQuotaUsage struct {
 	UserID                string                       `json:"user_id,omitempty"`
 	AccountID             string                       `json:"account_id,omitempty"`
@@ -105,11 +89,26 @@ type OpenAIQuotaUsage struct {
 	RateLimitResetCredits *OpenAIRateLimitResetCredits `json:"rate_limit_reset_credits,omitempty"`
 	Credits               *OpenAICredits               `json:"credits,omitempty"`
 	FetchedAt             int64                        `json:"fetched_at"`
+	CreditsPresent        bool                         `json:"-"`
+	CreditsObservedAtMs   int64                        `json:"-"`
 	autoResetCandidates   []openAIAutoResetCreditCandidate
 }
 
-// OpenAIQuotaResetCredit captures the redeemed credit metadata returned by the
-// reset endpoint.
+func (u *OpenAIQuotaUsage) UnmarshalJSON(data []byte) error {
+	type quotaUsageAlias OpenAIQuotaUsage
+	var decoded quotaUsageAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*u = OpenAIQuotaUsage(decoded)
+	_, u.CreditsPresent = fields["credits"]
+	return nil
+}
+
 type OpenAIQuotaResetCredit struct {
 	ID              string `json:"id,omitempty"`
 	ResetType       string `json:"reset_type,omitempty"`
@@ -120,18 +119,12 @@ type OpenAIQuotaResetCredit struct {
 	RedeemedAt      string `json:"redeemed_at,omitempty"`
 }
 
-// OpenAIQuotaResetResult is the typed projection of /wham/rate-limit-reset-credits/consume.
-// The inner Credit also carries `redeemed_at` (RFC3339 string); we deliberately do
-// NOT add a top-level redeemed_at to avoid ambiguity with the nested field.
 type OpenAIQuotaResetResult struct {
 	Code         string                  `json:"code"`
 	Credit       *OpenAIQuotaResetCredit `json:"credit,omitempty"`
 	WindowsReset int                     `json:"windows_reset"`
 }
 
-// OpenAIQuotaService queries and consumes ChatGPT/Codex rate-limit reset credits
-// for OpenAI OAuth accounts. It reuses the privacy client factory so all calls
-// flow through the impersonated HTTP client (Cloudflare-friendly TLS fingerprint).
 type OpenAIQuotaService struct {
 	accountRepo          AccountRepository
 	proxyRepo            ProxyRepository
@@ -142,9 +135,6 @@ type OpenAIQuotaService struct {
 	agentIdentityWS      agentIdentityWSConnectionInvalidator
 }
 
-// NewOpenAIQuotaService constructs a quota service. token provider is required —
-// it ensures we always invoke upstream with a valid (refreshed-if-needed)
-// access_token, sharing the same refresh/locking machinery used by the gateway.
 func NewOpenAIQuotaService(
 	accountRepo AccountRepository,
 	proxyRepo ProxyRepository,
@@ -161,10 +151,11 @@ func NewOpenAIQuotaService(
 	}
 }
 
-// QueryUsage fetches the latest rate-limit/usage snapshot for the given OpenAI
-// OAuth account. Returns infraerrors so the handler layer can map them to
-// stable error codes / HTTP statuses.
 func (s *OpenAIQuotaService) QueryUsage(ctx context.Context, accountID int64) (*OpenAIQuotaUsage, error) {
+	return s.queryUsage(ctx, accountID, true)
+}
+
+func (s *OpenAIQuotaService) queryUsage(ctx context.Context, accountID int64, includeResetCredits bool) (*OpenAIQuotaUsage, error) {
 	accessToken, chatGPTAccountID, proxyURL, fedRAMP, err := s.prepareUpstreamCall(ctx, accountID)
 	if err != nil {
 		return nil, err
@@ -180,11 +171,13 @@ func (s *OpenAIQuotaService) QueryUsage(ctx context.Context, accountID int64) (*
 	agentIdentity := s.isAgentIdentityAccount(ctx, accountID)
 
 	var payload OpenAIQuotaUsage
+	var observedAtMs int64
 	for recovered := false; ; {
 		quotaHeaders, expectedTaskID, headerErr := s.buildCodexQuotaHeaders(callCtx, accountID, accessToken, chatGPTAccountID, fedRAMP)
 		if headerErr != nil {
 			return nil, infraerrors.Newf(http.StatusBadGateway, "OPENAI_QUOTA_AUTH_FAILED", "failed to build upstream authentication: %v", headerErr)
 		}
+		observedAtMs = time.Now().UnixMilli()
 		resp, err := client.R().
 			SetContext(callCtx).
 			SetHeaders(quotaHeaders).
@@ -214,6 +207,10 @@ func (s *OpenAIQuotaService) QueryUsage(ctx context.Context, accountID int64) (*
 	}
 
 	payload.FetchedAt = time.Now().Unix()
+	payload.CreditsObservedAtMs = observedAtMs
+	if !includeResetCredits {
+		return &payload, nil
+	}
 	details := s.queryResetCreditDetails(callCtx, client, accessToken, chatGPTAccountID, fedRAMP, accountID)
 	if details != nil {
 		payload.autoResetCandidates = details.AutoResetCandidates
@@ -234,24 +231,14 @@ func (s *OpenAIQuotaService) QueryUsage(ctx context.Context, accountID int64) (*
 	return &payload, nil
 }
 
-// CacheResetCreditsSnapshot persists a complete reset-credit snapshot after an
-// explicit UI refresh. The snapshot is written to the account that was queried
-// (for a spark shadow that is the shadow row, even though the credits belong to
-// its parent) because it is a per-row display cache: each row caches exactly
-// what its own card renders, and shadows cannot consume credits anyway.
-//
-// Missing expiration details leave the old cache intact:
-// a snapshot claiming N>0 available credits without their expiration timestamps
-// cannot be aged out by readers, so it would keep showing (and offering to
-// consume) credits that already expired. Callers must treat this rejection as a
-// partial success — the upstream read itself is still valid.
+func (s *OpenAIQuotaService) QueryCreditsUsage(ctx context.Context, accountID int64) (*OpenAIQuotaUsage, error) {
+	return s.queryUsage(ctx, accountID, false)
+}
+
 func (s *OpenAIQuotaService) CacheResetCreditsSnapshot(ctx context.Context, accountID int64, credits *OpenAIRateLimitResetCredits) error {
 	return s.cacheResetCreditsSnapshot(ctx, accountID, credits, nil)
 }
 
-// CacheCreditsSnapshot stores the queried row's display snapshot independently
-// of reset-credit expiration details. A successful read with absent credits
-// replaces the previous balance with unknown, never with a fabricated zero.
 func (s *OpenAIQuotaService) CacheCreditsSnapshot(ctx context.Context, accountID int64, usage *OpenAIQuotaUsage) error {
 	if err := scopedAccountIDAccess(ctx, s.accountRepo, accountID, scopedAccountOperation(ctx, "openai.quota.read"), true); err != nil {
 		return err
@@ -259,15 +246,15 @@ func (s *OpenAIQuotaService) CacheCreditsSnapshot(ctx context.Context, accountID
 	if usage == nil {
 		return infraerrors.New(http.StatusBadGateway, "OPENAI_QUOTA_EMPTY_USAGE", "openai quota query returned an empty result")
 	}
+	snapshot := newOpenAICreditsSnapshot(usage.Credits, usage.FetchedAt, usage.CreditsObservedAtMs)
 	if err := s.accountRepo.UpdateExtra(ctx, accountID, map[string]any{
-		openaiQuotaCreditsKey: openAICreditsSnapshot{Credits: usage.Credits, FetchedAt: usage.FetchedAt},
+		openaiQuotaCreditsKey: snapshot,
 	}); err != nil {
 		return infraerrors.New(http.StatusInternalServerError, "OPENAI_QUOTA_CACHE_WRITE_FAILED", "failed to cache Codex credits").WithCause(err)
 	}
 	return nil
 }
 
-// CachePostResetSnapshot persists the credits and usage windows observed after a reset.
 func (s *OpenAIQuotaService) CachePostResetSnapshot(ctx context.Context, accountID int64, usage *OpenAIQuotaUsage) error {
 	if err := scopedAccountIDAccess(ctx, s.accountRepo, accountID, scopedAccountOperation(ctx, "openai.quota.reset"), true); err != nil {
 		return err
@@ -279,13 +266,14 @@ func (s *OpenAIQuotaService) CachePostResetSnapshot(ctx context.Context, account
 	if updates == nil {
 		updates = make(map[string]any)
 	}
-	updates[openaiQuotaCreditsKey] = openAICreditsSnapshot{Credits: usage.Credits, FetchedAt: usage.FetchedAt}
-	return s.cacheResetCreditsSnapshot(
-		ctx,
-		accountID,
-		usage.RateLimitResetCredits,
-		updates,
-	)
+	updates[openaiQuotaCreditsKey] = newOpenAICreditsSnapshot(usage.Credits, usage.FetchedAt, usage.CreditsObservedAtMs)
+	if credits := usage.RateLimitResetCredits; credits != nil && (credits.AvailableCount <= 0 || len(credits.Credits) > 0) {
+		return s.cacheResetCreditsSnapshot(ctx, accountID, credits, updates)
+	}
+	if err := s.accountRepo.UpdateExtra(ctx, accountID, updates); err != nil {
+		return err
+	}
+	return s.cacheResetCreditsSnapshot(ctx, accountID, usage.RateLimitResetCredits, nil)
 }
 
 func (s *OpenAIQuotaService) cacheResetCreditsSnapshot(ctx context.Context, accountID int64, credits *OpenAIRateLimitResetCredits, updates map[string]any) error {
@@ -345,9 +333,6 @@ func (s *OpenAIQuotaService) queryResetCreditDetails(ctx context.Context, client
 	return &details
 }
 
-// ResetCredit consumes one rate_limit_reset_credit for the given OpenAI account.
-// The redeem_request_id is auto-generated (uuid-like) — upstream uses it for
-// idempotency. Returns the consumed credit metadata so the UI can refresh.
 func (s *OpenAIQuotaService) ResetCredit(ctx context.Context, accountID int64) (*OpenAIQuotaResetResult, error) {
 	redeemRequestID, err := generateRedeemRequestID()
 	if err != nil {
@@ -356,8 +341,6 @@ func (s *OpenAIQuotaService) ResetCredit(ctx context.Context, accountID int64) (
 	return s.resetCredit(ctx, accountID, "", redeemRequestID, false)
 }
 
-// ResetCreditTargeted 使用固定卡 ID 与兑换 ID执行自动消费。调用方必须在重试时
-// 复用同一组参数；本方法不会回退到不带 credit_id 的旧消费方式。
 func (s *OpenAIQuotaService) ResetCreditTargeted(ctx context.Context, accountID int64, creditID, redeemRequestID string) (*OpenAIQuotaResetResult, error) {
 	creditID = strings.TrimSpace(creditID)
 	redeemRequestID = strings.TrimSpace(redeemRequestID)
@@ -372,14 +355,7 @@ func (s *OpenAIQuotaService) resetCredit(ctx context.Context, accountID int64, c
 	if err := scopedAccountIDAccess(ctx, s.accountRepo, accountID, "openai.quota.reset", false); err != nil {
 		return nil, err
 	}
-	// Shadow guard: resetting credits via a shadow account would silently
-	// operate on the parent's quota; that is surprising and unwanted. Callers
-	// must reset the parent account directly.
-	//
-	// Fail-closed: if the account cannot be loaded (transient DB error), we
-	// must NOT fall through to prepareUpstreamCall. That function resolves a
-	// shadow to its parent and would perform a parent-level reset — exactly
-	// what this guard must prevent. Return the load error instead.
+
 	if s.accountRepo != nil {
 		acc, loadErr := s.accountRepo.GetByID(ctx, accountID)
 		if loadErr != nil {
@@ -452,9 +428,6 @@ func (s *OpenAIQuotaService) resetCredit(ctx context.Context, accountID int64, c
 	return &payload, nil
 }
 
-// prepareUpstreamCall loads the account, validates it, obtains a fresh access
-// token via the shared TokenProvider, and resolves the chatgpt-account-id and
-// proxy URL. Centralized so QueryUsage / ResetCredit share validation.
 func (s *OpenAIQuotaService) prepareUpstreamCall(ctx context.Context, accountID int64) (accessToken, chatGPTAccountID, proxyURL string, fedRAMP bool, err error) {
 	if s == nil || s.accountRepo == nil || s.privacyClientFactory == nil {
 		return "", "", "", false, infraerrors.New(http.StatusInternalServerError, "OPENAI_QUOTA_NOT_CONFIGURED", "openai quota service is not configured")
@@ -477,9 +450,6 @@ func (s *OpenAIQuotaService) prepareUpstreamCall(ctx context.Context, accountID 
 		return "", "", "", false, infraerrors.New(http.StatusBadRequest, "OPENAI_QUOTA_INVALID_TYPE", "account is not an OAuth account")
 	}
 
-	// Spark shadow accounts do not hold their own credentials; resolve to the
-	// parent account so that chatgpt_account_id / access_token / proxy all come
-	// from the parent. This must happen BEFORE the chatgpt_account_id check.
 	if account.IsShadow() {
 		resolved, rerr := resolveCredentialAccount(ctx, s.accountRepo, account)
 		if rerr != nil {
@@ -493,7 +463,7 @@ func (s *OpenAIQuotaService) prepareUpstreamCall(ctx context.Context, accountID 
 
 	chatGPTAccountID = strings.TrimSpace(account.GetCredential("chatgpt_account_id"))
 	if chatGPTAccountID == "" {
-		// Fall back to organization_id — some legacy accounts only persisted poid.
+
 		chatGPTAccountID = strings.TrimSpace(account.GetCredential("organization_id"))
 	}
 	if chatGPTAccountID == "" {
@@ -514,11 +484,6 @@ func (s *OpenAIQuotaService) prepareUpstreamCall(ctx context.Context, accountID 
 	}
 	fedRAMP = account.IsChatGPTAccountFedRAMP()
 
-	// account.Proxy is eager-loaded by accountRepo.GetByID (see
-	// repository.accountsToService), so we can read the proxy URL directly
-	// instead of round-tripping the DB again. Fall back to proxyRepo only
-	// when Proxy isn't pre-populated (defensive — e.g. callers that built
-	// the Account by hand).
 	if account.ProxyID != nil {
 		switch {
 		case account.Proxy != nil:
@@ -638,8 +603,6 @@ func (s *OpenAIQuotaService) redactQuotaErrorBody(ctx context.Context, accountID
 	return string(redactAgentIdentitySensitiveBodyForAccount(ctx, s.accountRepo, account, []byte(body)))
 }
 
-// buildCodexCommonHeaders sets the request headers expected by the chatgpt.com
-// backend so calls succeed past Cloudflare/WASM checks.
 func buildCodexCommonHeaders(accessToken, chatGPTAccountID string, fedRAMP bool) map[string]string {
 	headers := map[string]string{
 		"authorization":      "Bearer " + accessToken,
@@ -659,27 +622,18 @@ func buildCodexCommonHeaders(accessToken, chatGPTAccountID string, fedRAMP bool)
 	return headers
 }
 
-// generateRedeemRequestID produces a UUID-v4-shaped string without pulling in a
-// new dependency. ChatGPT uses this as an idempotency key for the consume call.
 func generateRedeemRequestID() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
-	// Set version (4) and variant (RFC 4122) bits.
+
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
 	hexStr := hex.EncodeToString(b)
 	return fmt.Sprintf("%s-%s-%s-%s-%s", hexStr[0:8], hexStr[8:12], hexStr[12:16], hexStr[16:20], hexStr[20:]), nil
 }
 
-// buildCodexSparkWindowExtraUpdates extracts Codex Spark usage windows from the
-// /wham/usage response body's additional_rate_limits, matching the entry with
-// MeteredFeature == "codex_bengalfox". It produces plain codex_* keys (NOT the
-// Method-Z "codex_spark_" prefix) so that a spark shadow account's extra map
-// is populated with the same key names used by the scheduling / frontend layers.
-// Returns nil when no codex_bengalfox entry is present or when the RateLimit
-// yields no window data.
 func buildCodexSparkWindowExtraUpdates(usage *OpenAIQuotaUsage, now time.Time) map[string]any {
 	if usage == nil {
 		return nil
@@ -696,8 +650,6 @@ func buildCodexSparkWindowExtraUpdates(usage *OpenAIQuotaUsage, now time.Time) m
 		return nil
 	}
 
-	// Reuse OpenAICodexUsageSnapshot / Normalize to map primary/secondary windows
-	// to canonical 5h/7d buckets (same logic as probeOpenAICodexSnapshot).
 	snap := &OpenAICodexUsageSnapshot{}
 	if w := spark.PrimaryWindow; w != nil {
 		p := w.UsedPercent
@@ -753,10 +705,6 @@ func buildCodexSparkWindowExtraUpdates(usage *OpenAIQuotaUsage, now time.Time) m
 	return updates
 }
 
-// mapUpstreamStatus collapses upstream HTTP statuses into a stable set we
-// surface from the admin handler. 4xx upstream errors are surfaced as 502
-// (BadGateway) so callers can distinguish "your input is bad" (400) from
-// "upstream said no" (502); 401/403 are bubbled directly to hint at re-auth.
 func mapUpstreamStatus(status int) int {
 	switch {
 	case status == http.StatusUnauthorized || status == http.StatusForbidden:

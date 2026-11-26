@@ -1,8 +1,5 @@
 package service
 
-// 本文件由 openai_gateway_service.go 纯移动拆分而来：粘性会话哈希、账号选择与
-// 负载感知调度、配额自动暂停判定、并发槽位获取。仅做代码搬迁，无任何行为变更。
-
 import (
 	"context"
 	"encoding/json"
@@ -38,10 +35,6 @@ var explicitOpenAIHeaderSessionNames = []string{
 	codeBuddyConversationHeader,
 }
 
-// explicitOpenAIHeaderSessionID resolves stable conversation identifiers sent
-// by OpenAI-compatible clients. Keep this list limited to session-scoped
-// fields: request/message IDs rotate every turn and would defeat sticky routing
-// and upstream prompt caching.
 func explicitOpenAIHeaderSessionID(c *gin.Context) string {
 	if c == nil {
 		return ""
@@ -55,8 +48,6 @@ func explicitOpenAIHeaderSessionID(c *gin.Context) string {
 	return ""
 }
 
-// ExtractSessionID extracts the raw session ID from headers or body without hashing.
-// Used by ForwardAsAnthropic to pass as prompt_cache_key for upstream cache.
 func (s *OpenAIGatewayService) ExtractSessionID(c *gin.Context, body []byte) string {
 	return explicitOpenAIRequestSessionID(c, body)
 }
@@ -73,9 +64,6 @@ func explicitOpenAISessionID(c *gin.Context, body []byte) string {
 	return sessionID
 }
 
-// openAIRequestPayloadView unwraps Responses WebSocket event envelopes while
-// leaving ordinary HTTP objects untouched even when they contain a response
-// field for another purpose.
 func openAIRequestPayloadView(body []byte) gjson.Result {
 	root := parseRawJSONView(body)
 	eventType := strings.ToLower(strings.TrimSpace(root.Get("type").String()))
@@ -87,16 +75,6 @@ func openAIRequestPayloadView(body []byte) gjson.Result {
 	return root
 }
 
-// explicitOpenAIRequestSessionID extends the common OpenAI session signals
-// with Grok's native conversation header only for requests authenticated to a
-// Grok group. This keeps an unrelated x-grok-conv-id header from changing
-// scheduling or upstream session behavior for non-Grok groups.
-//
-// For Grok groups only, previous_response_id is a last-resort sticky seed so
-// multi-turn Responses chains stay on the same OAuth account when no explicit
-// session/conversation/prompt_cache_key is present. Non-Grok groups omit this
-// so HTTP OpenAI paths that delete previous_response_id before upstream are
-// unchanged.
 func explicitOpenAIRequestSessionID(c *gin.Context, body []byte) string {
 	if c == nil {
 		return ""
@@ -115,9 +93,6 @@ func explicitOpenAIRequestSessionID(c *gin.Context, body []byte) string {
 	return sessionID
 }
 
-// grokPreviousResponseSessionSeed returns a stable sticky seed from a Responses
-// previous_response_id. Only resp_* response ids are accepted; message ids and
-// unknown shapes must not pin sticky routing or prompt-cache identity.
 func grokPreviousResponseSessionSeed(body []byte) string {
 	id := strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String())
 	if id == "" {
@@ -126,13 +101,10 @@ func grokPreviousResponseSessionSeed(body []byte) string {
 	if ClassifyOpenAIPreviousResponseIDKind(id) != OpenAIPreviousResponseIDKindResponseID {
 		return ""
 	}
-	// Namespace so content-derived seeds never collide with response ids.
+
 	return "grok-prev-resp:" + id
 }
 
-// GenerateExplicitSessionHash generates a sticky-session hash only from explicit
-// client session signals. It intentionally skips content-derived fallback and is
-// used by stateless endpoints such as /v1/images.
 func (s *OpenAIGatewayService) GenerateExplicitSessionHash(c *gin.Context, body []byte) string {
 	sessionID := explicitOpenAIRequestSessionID(c, body)
 	if sessionID == "" {
@@ -144,23 +116,6 @@ func (s *OpenAIGatewayService) GenerateExplicitSessionHash(c *gin.Context, body 
 	return currentHash
 }
 
-// GenerateSessionHash generates a sticky-session hash for OpenAI requests.
-//
-// Priority:
-//  1. Header: session-id / session_id
-//  2. Header: conversation_id
-//  3. Header: x-session-affinity / x-session-id / x-opencode-session (OpenCode)
-//  4. Header: x-conversation-id (CodeBuddy)
-//  5. Header: x-grok-conv-id (Grok groups only)
-//  6. Body:   prompt_cache_key
-//  7. Body:   content-based fallback (model + system + tools + first user message)
-//
-// Grok sticky affinity is intentionally separate from the upstream
-// prompt_cache_key identity (resolveGrokCacheIdentity): sticky pins an OAuth
-// account for multi-turn routing, while the cache identity is tenant+model
-// isolated for xAI server-side prompt cache. For Grok groups we scope the
-// sticky seed with the client-requested model so switching models does not
-// inherit a stale account binding (grok2api affinityKey pattern).
 func (s *OpenAIGatewayService) GenerateSessionHash(c *gin.Context, body []byte) string {
 	if c == nil {
 		return ""
@@ -183,8 +138,6 @@ func (s *OpenAIGatewayService) GenerateSessionHash(c *gin.Context, body []byte) 
 	return currentHash
 }
 
-// grokStickyAffinitySeed scopes sticky routing by model without changing the
-// upstream prompt_cache_key written by applyGrokResponsesCacheIdentity.
 func grokStickyAffinitySeed(sessionID string, body []byte) string {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
@@ -200,9 +153,6 @@ func grokStickyAffinitySeed(sessionID string, body []byte) string {
 	return "grok-affinity:v1:" + model + ":" + sessionID
 }
 
-// GenerateSessionHashWithFallback 先按常规信号生成会话哈希；
-// 当未携带 session_id/conversation_id/prompt_cache_key 时，使用 fallbackSeed 生成稳定哈希。
-// 该方法用于 WS ingress，避免会话信号缺失时发生跨账号漂移。
 func (s *OpenAIGatewayService) GenerateSessionHashWithFallback(c *gin.Context, body []byte, fallbackSeed string) string {
 	sessionHash := s.GenerateSessionHash(c, body)
 	if sessionHash != "" {
@@ -231,7 +181,6 @@ func resolveOpenAIUpstreamOriginator(c *gin.Context, isOfficialClient bool) stri
 	return "opencode"
 }
 
-// BindStickySession sets session -> account binding with standard TTL.
 func (s *OpenAIGatewayService) BindStickySession(ctx context.Context, groupID *int64, sessionHash string, accountID int64) error {
 	if sessionHash == "" || accountID <= 0 {
 		return nil
@@ -243,25 +192,18 @@ func (s *OpenAIGatewayService) BindStickySession(ctx context.Context, groupID *i
 	return s.setStickySessionAccountID(ctx, groupID, sessionHash, accountID, ttl)
 }
 
-// SelectAccount selects an OpenAI account with sticky session support
 func (s *OpenAIGatewayService) SelectAccount(ctx context.Context, groupID *int64, sessionHash string) (*Account, error) {
 	return s.SelectAccountForModel(ctx, groupID, sessionHash, "")
 }
 
-// SelectAccountForModel selects an account supporting the requested model
 func (s *OpenAIGatewayService) SelectAccountForModel(ctx context.Context, groupID *int64, sessionHash string, requestedModel string) (*Account, error) {
 	return s.SelectAccountForModelWithExclusions(ctx, groupID, sessionHash, requestedModel, nil)
 }
 
-// SelectAccountForModelWithExclusions selects an account supporting the requested model while excluding specified accounts.
-// SelectAccountForModelWithExclusions 选择支持指定模型的账号，同时排除指定的账号。
 func (s *OpenAIGatewayService) SelectAccountForModelWithExclusions(ctx context.Context, groupID *int64, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}) (*Account, error) {
 	return s.selectAccountForModelWithExclusions(s.withOpenAIQuotaAutoPauseContext(ctx), groupID, PlatformOpenAI, sessionHash, requestedModel, excludedIDs, false, 0, "", false)
 }
 
-// SelectAccountForTokenCount selects an account for a non-billable token-count
-// request. It applies the normal platform, model, capability, and runtime
-// eligibility checks without acquiring or waiting for a generation slot.
 func (s *OpenAIGatewayService) SelectAccountForTokenCount(
 	ctx context.Context,
 	groupID *int64,
@@ -286,11 +228,6 @@ func (s *OpenAIGatewayService) SelectAccountForTokenCount(
 	)
 }
 
-// NormalizeOpenAICompatiblePlatform 保留走 OpenAI 网关的平台（openai、grok 与多协议
-// API Key 供应商，见平台清单）的原值，其他值一律归一为 openai。调度器据此对账号与请求做精确平台匹配：
-// kimi 分组请求只命中 kimi 账号，语义与 openai/grok 一致。
-// （upstream 曾将本函数改为未导出 normalizeOpenAICompatiblePlatform，本分支的
-// handler 调度入口仍需导出，保持导出名。）
 func NormalizeOpenAICompatiblePlatform(platform string) string {
 	if domain.UsesOpenAIGateway(platform) {
 		return platform
@@ -298,14 +235,6 @@ func NormalizeOpenAICompatiblePlatform(platform string) string {
 	return PlatformOpenAI
 }
 
-// noAvailableOpenAISelectionError builds the standard "no account available" error
-// while preserving the legacy /responses/compact error when applicable.
-// details carries an optional machine-parseable exclusion summary (e.g.
-// "pool=2, filtered: quota_auto_pause_7d=1 runtime_blocked=1") appended in
-// parentheses. It is for server-side logs / ops diagnostics only: handlers
-// never forward this error text to OpenAI-platform clients (they respond with
-// the generic classification message). Callers that must preserve the legacy
-// message pass "".
 func noAvailableOpenAISelectionError(requestedModel string, compactBlocked bool, details string) error {
 	if compactBlocked {
 		return ErrNoAvailableCompactAccounts
@@ -332,8 +261,6 @@ func (e openAINoAvailableSelectionError) Unwrap() error {
 	return ErrNoAvailableAccounts
 }
 
-// openAICompactSupportTier classifies an OpenAI-compatible account by compact capability.
-// 0 = explicitly unsupported, 1 = unknown / not yet probed, 2 = explicitly supported.
 func openAICompactSupportTier(account *Account) int {
 	if account == nil {
 		return 0
@@ -354,34 +281,21 @@ func openAICompactSupportTier(account *Account) int {
 	return 0
 }
 
-// isOpenAICompatibleAccountEligibleForRequest 判断 OpenAI 兼容账号是否满足本次请求的调度条件。
-// 检查内容包括：平台匹配、账号可用性、quota 自动暂停、spark 路由限制、模型支持及端点能力。
-//
-// 注意：对 spark 影子账号，调用方还须额外调用 parentHealthyForShadow(account, lookup)
-// 检查母账号凭据可用性；该检查未内置于本函数，以避免注入 DB 依赖。
 func isOpenAICompatibleAccountEligibleForRequest(ctx context.Context, account *Account, platform string, requestedModel string, requireCompact bool, requiredCapability OpenAIEndpointCapability) bool {
 	return openAICompatibleAccountEligibilityFailureReason(ctx, account, platform, requestedModel, requireCompact, requiredCapability) == ""
 }
 
-// openAICompatibleAccountEligibilityFailureReason mirrors the legacy boolean
-// eligibility check while naming its first veto point. Load-batch selection uses
-// the reason only for server-side no-account diagnostics; the admission behavior
-// remains unchanged.
 func openAICompatibleAccountEligibilityFailureReason(ctx context.Context, account *Account, platform string, requestedModel string, requireCompact bool, requiredCapability OpenAIEndpointCapability) string {
 	if reason := openAICompatibleAccountEligibilityFailureReasonBeforeProfit(ctx, account, platform, requestedModel, requireCompact, requiredCapability); reason != "" {
 		return reason
 	}
-	// 分组利润控制：legacy 引擎的粘性/候选循环与 DB recheck 共用
-	// 本判定，任何 fallback 都不能把利润不合格账号重新放回候选。
+
 	if vetoed, reason := openAIProfitControlVetoReason(ctx, account); vetoed {
 		return reason
 	}
 	return ""
 }
 
-// isOpenAICompatibleAccountEligibleForRequestBeforeProfit applies every
-// ordinary scheduling gate. Legacy selection uses it before classifying the
-// profit veto so earlier failures retain their actual reason.
 func isOpenAICompatibleAccountEligibleForRequestBeforeProfit(ctx context.Context, account *Account, platform string, requestedModel string, requireCompact bool, requiredCapability OpenAIEndpointCapability) bool {
 	return openAICompatibleAccountEligibilityFailureReasonBeforeProfit(ctx, account, platform, requestedModel, requireCompact, requiredCapability) == ""
 }
@@ -391,11 +305,7 @@ func openAICompatibleAccountEligibilityFailureReasonBeforeProfit(ctx context.Con
 	if account == nil {
 		return "account_nil"
 	}
-	// account_model composite routes publish an alias that only accounts with an
-	// explicit model mapping own. Both scheduler modes (advanced and legacy) must
-	// enforce ownership before any priority/sticky/transport consideration; a
-	// non-owner would forward the raw public alias and get model_not_found or
-	// hit an unrelated same-name upstream model.
+
 	if source, ok := CompositeRouteSourceFromContext(ctx); ok && source == CompositeRouteSourceAccount {
 		if publicModel, modelOK := RequestedPublicModelFromContext(ctx); modelOK && !explicitModelMappingClaims(*account, publicModel) {
 			return "account_model_not_owned"
@@ -412,8 +322,7 @@ func openAICompatibleAccountEligibilityFailureReasonBeforeProfit(ctx context.Con
 	}
 	if account.IsOpenAI() {
 		if paused, reason := shouldAutoPauseOpenAIAccountByQuota(ctx, account); paused {
-			// Debug level: this fires per-candidate on the scheduling hot path, so Info
-			// would amplify into log spam once several accounts cross the threshold.
+
 			slog.Debug("account_auto_paused_by_quota",
 				"account_id", account.ID,
 				"window", reason.window,
@@ -534,12 +443,16 @@ func shouldAutoPauseOpenAIAccountByQuota(ctx context.Context, account *Account) 
 	if account == nil || !account.IsOpenAI() {
 		return false, openAIQuotaAutoPauseDecision{}
 	}
-	// 自动用卡有独立阈值：达到消费阈值时必须先退出调度；仅达到普通暂停阈值时，
-	// 只有新鲜状态明确存在可用卡才继续放行到消费阈值。
+	creditsAvailable := openAICodexCreditsStateForAccount(account, time.Now()) == OpenAICodexCreditsAvailable
+
 	if config := ResolveOpenAIAutoResetCreditConfig(account); config.Enabled {
 		now := time.Now()
 		utilization5h, has5h := resolveOpenAIQuotaUtilization(account.Extra, "5h", now)
 		utilization7d, has7d := resolveOpenAIQuotaUtilization(account.Extra, "7d", now)
+		state := openAIAutoResetStateFromExtra(account.Extra)
+		if creditsAvailable && openAIAutoResetNoCreditConfirmed(state, now) {
+			return false, openAIQuotaAutoPauseDecision{}
+		}
 		if has5h && utilization5h >= config.Threshold5h {
 			notifyOpenAIAutoResetFromScheduler(account.ID)
 			return true, openAIQuotaAutoPauseDecision{window: "5h", threshold: config.Threshold5h, utilization: utilization5h, reason: "quota_auto_reset_pending_5h"}
@@ -555,6 +468,9 @@ func shouldAutoPauseOpenAIAccountByQuota(ctx context.Context, account *Account) 
 		pauseReached5h := !disabled5h && pause5h > 0 && has5h && utilization5h >= pause5h
 		pauseReached7d := !disabled7d && pause7d > 0 && has7d && utilization7d >= pause7d
 		if pauseReached5h || pauseReached7d {
+			if creditsAvailable {
+				return false, openAIQuotaAutoPauseDecision{}
+			}
 			state := openAIAutoResetStateFromExtra(account.Extra)
 			if state != nil && state.Status == OpenAIAutoResetStatusAvailable && state.AvailableCount > 0 && !openAIAutoResetStateStale(state, now) {
 				return false, openAIQuotaAutoPauseDecision{}
@@ -566,31 +482,33 @@ func shouldAutoPauseOpenAIAccountByQuota(ctx context.Context, account *Account) 
 			return true, openAIQuotaAutoPauseDecision{window: "7d", threshold: pause7d, utilization: utilization7d, reason: "quota_auto_reset_credit_check_7d"}
 		}
 	}
-	// Per-account explicit-disable flags must take precedence over the global default.
-	// Without these, leaving the account threshold blank means "use global default",
-	// so an admin has no way to exempt a single account from auto-pause once a global
-	// default exists. The disable flag is per-window so an account can opt out of
-	// only 5h or only 7d auto-pause.
+	if creditsAvailable {
+		return false, openAIQuotaAutoPauseDecision{}
+	}
+
 	disabled5h := resolveAccountExtraBool(account.Extra, "auto_pause_5h_disabled")
 	disabled7d := resolveAccountExtraBool(account.Extra, "auto_pause_7d_disabled")
 	threshold5h, threshold7d := resolveOpenAIQuotaAutoPauseThresholds(ctx, account)
 	now := time.Now()
 	if !disabled5h && threshold5h > 0 {
 		if utilization, ok := resolveOpenAIQuotaUtilization(account.Extra, "5h", now); ok && utilization >= threshold5h {
+			if openAICodexCreditsStateForAccount(account, now) == OpenAICodexCreditsUnknown {
+				notifyOpenAIAutoResetFromScheduler(account.ID)
+			}
 			return true, openAIQuotaAutoPauseDecision{window: "5h", threshold: threshold5h, utilization: utilization}
 		}
 	}
 	if !disabled7d && threshold7d > 0 {
 		if utilization, ok := resolveOpenAIQuotaUtilization(account.Extra, "7d", now); ok && utilization >= threshold7d {
+			if openAICodexCreditsStateForAccount(account, now) == OpenAICodexCreditsUnknown {
+				notifyOpenAIAutoResetFromScheduler(account.ID)
+			}
 			return true, openAIQuotaAutoPauseDecision{window: "7d", threshold: threshold7d, utilization: utilization}
 		}
 	}
 	return false, openAIQuotaAutoPauseDecision{}
 }
 
-// resolveAccountExtraBool reads a bool-like value from account extra, tolerating
-// the few shapes JSON unmarshalling may produce (real bool, "true"/"false"
-// strings, 0/1 numbers).
 func resolveAccountExtraBool(extra map[string]any, key string) bool {
 	if len(extra) == 0 {
 		return false
@@ -672,13 +590,6 @@ func resolveAccountExtraNumber(extra map[string]any, keys ...string) (float64, b
 	return 0, false
 }
 
-// resolveOpenAIQuotaUtilization returns the current utilization ratio (0..1) for the
-// given Codex usage window. ok=false means there is no usable signal to pause on:
-// either no snapshot exists, the window has rolled over, or an old snapshot has
-// no known future reset. The stale guard matters because a paused account stops
-// receiving requests, so its snapshot is never refreshed from upstream headers —
-// without this check an old used_percent would keep the account paused forever even
-// after the real window reset.
 func resolveOpenAIQuotaUtilization(extra map[string]any, window string, now time.Time) (float64, bool) {
 	usedPercent := readOpenAIQuotaUsedPercent(extra, window)
 	if usedPercent <= 0 {
@@ -687,8 +598,7 @@ func resolveOpenAIQuotaUtilization(extra map[string]any, window string, now time
 	if openAIQuotaWindowReset(extra, window, now) {
 		return 0, false
 	}
-	// 快照过于陈旧且没有明确的未来重置时间时，不再据此暂停。放行后下一次响应头
-	// 会刷新快照实现自愈，避免账号在错误/过期的 used% 上被永久跳过（issue #2994）。
+
 	if openAICodexSnapshotStaleForPause(extra, now) && !openAIQuotaWindowResetPending(extra, window, now) {
 		return 0, false
 	}
@@ -700,13 +610,6 @@ func openAIQuotaWindowResetPending(extra map[string]any, window string, now time
 	return ok && now.Before(resetAt)
 }
 
-// openAICodexSnapshotStaleForPause reports whether the Codex usage snapshot is stale
-// enough that it should no longer keep an account auto-paused. It anchors on
-// codex_usage_updated_at (always written by buildCodexUsageExtraUpdates). A missing or
-// unparseable timestamp returns false (treated as fresh, so the account stays paused) —
-// this is deliberate: it prevents any snapshot without a write time from silently escaping
-// auto-pause, and a genuinely-exhausted account that is actively served refreshes the
-// timestamp on every response so it never crosses the staleness bound.
 func openAICodexSnapshotStaleForPause(extra map[string]any, now time.Time) bool {
 	if len(extra) == 0 {
 		return false
@@ -722,16 +625,11 @@ func openAICodexSnapshotStaleForPause(extra map[string]any, now time.Time) bool 
 	return now.Sub(updatedAt) >= openAICodexAutoPauseStaleAfter
 }
 
-// openAIQuotaWindowReset reports whether the Codex usage window's reset time has
-// already passed relative to now. It prefers the absolute codex_<window>_reset_at
-// timestamp and falls back to codex_<window>_reset_after_seconds anchored at
-// codex_usage_updated_at, mirroring AccountUsageService's window-progress logic.
 func openAIQuotaWindowReset(extra map[string]any, window string, now time.Time) bool {
 	resetAt, ok := openAICodexWindowResetAt(extra, window)
 	return ok && !now.Before(resetAt)
 }
 
-// 绝对时间优先；相对倒计时必须锚定快照采样时间，不能随每次评分向后滑动。
 func openAICodexWindowResetAt(extra map[string]any, window string) (time.Time, bool) {
 	if len(extra) == 0 {
 		return time.Time{}, false
@@ -786,9 +684,6 @@ func (s *OpenAIGatewayService) withOpenAIQuotaAutoPauseContext(ctx context.Conte
 	return withOpenAIQuotaAutoPauseSettings(ctx, s.settingService.GetOpenAIQuotaAutoPauseSettings(ctx))
 }
 
-// prioritizeOpenAICompactAccounts re-orders a slice so that accounts with known
-// compact support are tried first, followed by unknown, then explicitly unsupported.
-// The relative order within each tier is preserved.
 func prioritizeOpenAICompactAccounts(accounts []*Account) []*Account {
 	if len(accounts) == 0 {
 		return nil
@@ -813,23 +708,13 @@ func prioritizeOpenAICompactAccounts(accounts []*Account) []*Account {
 	return out
 }
 
-// resolveOpenAIAccountUpstreamModelForRequest resolves the upstream model that
-// would be sent for a given request, honoring the legacy compact-only mapping
-// when the caller is on the /responses/compact path.
 func resolveOpenAIAccountUpstreamModelForRequest(account *Account, requestedModel string, requireCompact bool) string {
-	// Forward checks the raw Chat Completions fallback before passthrough.
-	// These API-key accounts therefore apply normal account model_mapping and
-	// upstream normalization, but never compact_model_mapping.
+
 	if shouldForwardOpenAIResponsesViaRawChatCompletions(account) {
 		upstreamModel := resolveOpenAIForwardModel(account, requestedModel, "")
 		return normalizeOpenAIModelForUpstream(account, upstreamModel)
 	}
 
-	// Passthrough accounts only replace authentication. Their Forward path
-	// keeps the channel-mapped model in the request body and does not apply the
-	// account's normal model_mapping. Legacy /responses/compact is the one
-	// exception: forwardOpenAIPassthrough applies compact_model_mapping
-	// directly to that channel-mapped model.
 	if account != nil && account.IsOpenAIPassthroughEnabled() {
 		upstreamModel := strings.TrimSpace(requestedModel)
 		if upstreamModel == "" {
@@ -841,9 +726,6 @@ func resolveOpenAIAccountUpstreamModelForRequest(account *Account, requestedMode
 		return upstreamModel
 	}
 
-	// Compact mappings are keyed by the client-visible model. Prefer an exact
-	// compact rule before ordinary account mapping; otherwise a normal alias can
-	// hide the compact-specific rule and make scheduling disagree with Forward.
 	if requireCompact && account != nil {
 		if compactModel, matched := account.ResolveCompactMappedModel(strings.TrimSpace(requestedModel)); matched {
 			if compactModel = strings.TrimSpace(compactModel); compactModel != "" {
@@ -865,15 +747,10 @@ func resolveOpenAIAccountUpstreamModelForRequest(account *Account, requestedMode
 	return normalizeOpenAIModelForUpstream(account, upstreamModel)
 }
 
-// ResolveOpenAIAccountUpstreamModelForRequest exposes the scheduler's exact
-// account mapping chain to handler-side outcome reporting.
 func ResolveOpenAIAccountUpstreamModelForRequest(account *Account, requestedModel string, requireCompact bool) string {
 	return resolveOpenAIAccountUpstreamModelForRequest(account, requestedModel, requireCompact)
 }
 
-// resolveOpenAIForwardMappedModels is the shared account mapping chain for
-// Forward callers. billingModel retains the ordinary mapping used for usage
-// accounting, while upstreamModel is the model the scheduler has admitted.
 func resolveOpenAIForwardMappedModels(account *Account, requestedModel string, requireCompact bool) (billingModel, upstreamModel string) {
 	requestedModel = strings.TrimSpace(requestedModel)
 	if account != nil && account.IsOpenAIPassthroughEnabled() {
@@ -903,8 +780,6 @@ func (s *OpenAIGatewayService) selectAccountForModelWithExclusions(ctx context.C
 	return account, err
 }
 
-// selectAccountForModelWithExclusionsStickyHit 与 selectAccountForModelWithExclusions 相同，
-// 另返回账号是否来自粘性会话命中。
 func (s *OpenAIGatewayService) selectAccountForModelWithExclusionsStickyHit(ctx context.Context, groupID *int64, platform string, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, requireCompact bool, stickyAccountID int64, requiredCapability OpenAIEndpointCapability, preferLowUpstreamRate bool) (*Account, bool, error) {
 	platform = NormalizeOpenAICompatiblePlatform(platform)
 	if s.checkChannelPricingRestriction(ctx, groupID, requestedModel) {
@@ -914,21 +789,15 @@ func (s *OpenAIGatewayService) selectAccountForModelWithExclusionsStickyHit(ctx 
 		return nil, false, fmt.Errorf("%w supporting model: %s (channel pricing restriction)", ErrNoAvailableAccounts, requestedModel)
 	}
 
-	// 1. 尝试粘性会话命中
-	// Try sticky session hit
 	if account := s.tryStickySessionHit(ctx, groupID, platform, sessionHash, requestedModel, excludedIDs, requireCompact, stickyAccountID, requiredCapability); account != nil {
 		return account, true, nil
 	}
 
-	// 2. 获取可调度的 OpenAI 账号
-	// Get schedulable OpenAI accounts
 	accounts, err := s.listSchedulableAccounts(ctx, groupID, platform)
 	if err != nil {
 		return nil, false, fmt.Errorf("query accounts failed: %w", err)
 	}
 
-	// 3. 按优先级 + LRU 选择最佳账号
-	// Select by priority + LRU
 	selected, compactBlocked, filterStats := s.selectBestAccount(ctx, groupID, platform, accounts, requestedModel, excludedIDs, requireCompact, requiredCapability, preferLowUpstreamRate)
 
 	if selected == nil {
@@ -940,9 +809,6 @@ func (s *OpenAIGatewayService) selectAccountForModelWithExclusionsStickyHit(ctx 
 		return nil, false, err
 	}
 
-	// 4. 设置粘性会话绑定（利润门下推迟到 handler 终检通过后再绑定，
-	// 终检否决的账号不得成为新的粘性目标；无门保持既有 eager 绑定与 TTL）
-	// Set sticky session binding (deferred until terminal admission under a profit gate)
 	if sessionHash != "" && !gatewayProfitControlGateActive(ctx) {
 		_ = s.setStickySessionAccountID(ctx, groupID, sessionHash, selected.ID, openaiStickySessionTTL)
 	}
@@ -950,11 +816,6 @@ func (s *OpenAIGatewayService) selectAccountForModelWithExclusionsStickyHit(ctx 
 	return hydrated, false, nil
 }
 
-// tryStickySessionHit 尝试从粘性会话获取账号。
-// 如果命中且账号可用则返回账号；如果账号不可用则清理会话并返回 nil。
-//
-// tryStickySessionHit attempts to get account from sticky session.
-// Returns account if hit and usable; clears session and returns nil if account is unavailable.
 func (s *OpenAIGatewayService) tryStickySessionHit(ctx context.Context, groupID *int64, platform string, sessionHash, requestedModel string, excludedIDs map[int64]struct{}, requireCompact bool, stickyAccountID int64, requiredCapability OpenAIEndpointCapability) *Account {
 	if sessionHash == "" {
 		return nil
@@ -980,15 +841,11 @@ func (s *OpenAIGatewayService) tryStickySessionHit(ctx context.Context, groupID 
 		return nil
 	}
 
-	// 检查账号是否需要清理粘性会话
-	// Check if sticky session should be cleared
 	if shouldClearStickySession(account, requestedModel) {
 		_ = s.deleteStickySessionAccountID(ctx, groupID, sessionHash)
 		return nil
 	}
 
-	// 验证账号是否可用于当前请求
-	// Verify account is usable for current request
 	if !isOpenAICompatibleAccountEligibleForRequest(ctx, account, platform, requestedModel, false, requiredCapability) {
 		return nil
 	}
@@ -1011,21 +868,10 @@ func (s *OpenAIGatewayService) tryStickySessionHit(ctx context.Context, groupID 
 		return nil
 	}
 
-	// 刷新会话 TTL 并返回账号
-	// Refresh session TTL and return account
 	_ = s.refreshStickySessionTTL(ctx, groupID, sessionHash, openaiStickySessionTTL)
 	return account
 }
 
-// selectBestAccount 从候选账号中选择最佳账号（优先级 + LRU）。
-// 返回 nil 表示无可用账号。
-//
-// selectBestAccount selects the best account from candidates (priority + LRU).
-// Returns nil if no available account. The second return reports whether at
-// least one candidate was filtered out solely because it lacks compact support
-// (only meaningful when the legacy /responses/compact requireCompact flag is
-// true); the third contains deterministic
-// exclusion diagnostics for the evaluated snapshot.
 func (s *OpenAIGatewayService) selectBestAccount(ctx context.Context, groupID *int64, platform string, accounts []Account, requestedModel string, excludedIDs map[int64]struct{}, requireCompact bool, requiredCapability OpenAIEndpointCapability, preferLowUpstreamRate bool) (*Account, bool, openAISelectionFilterStats) {
 	platform = NormalizeOpenAICompatiblePlatform(platform)
 	compactBlocked := false
@@ -1037,8 +883,6 @@ func (s *OpenAIGatewayService) selectBestAccount(ctx context.Context, groupID *i
 	for i := range accounts {
 		acc := &accounts[i]
 
-		// 跳过被排除的账号
-		// Skip excluded accounts
 		if _, excluded := excludedIDs[acc.ID]; excluded {
 			filterStats.exclude("excluded")
 			continue
@@ -1096,14 +940,8 @@ func (s *OpenAIGatewayService) selectBestAccount(ctx context.Context, groupID *i
 	return eligible[0], compactBlocked, filterStats
 }
 
-// isBetterAccount 判断 candidate 是否比 current 更优。
-// 规则：优先级更高（数值更小）优先；同优先级时，未使用过的优先，其次是最久未使用的。
-//
-// isBetterAccount checks if candidate is better than current.
-// Rules: higher priority (lower value) wins; same priority: never used > least recently used.
 func (s *OpenAIGatewayService) isBetterAccount(candidate, current *Account) bool {
-	// 优先级更高（数值更小）
-	// Higher priority (lower value)
+
 	if candidate.Priority < current.Priority {
 		return true
 	}
@@ -1111,30 +949,26 @@ func (s *OpenAIGatewayService) isBetterAccount(candidate, current *Account) bool
 		return false
 	}
 
-	// 同优先级，比较最后使用时间
-	// Same priority, compare last used time
 	switch {
 	case candidate.LastUsedAt == nil && current.LastUsedAt != nil:
-		// candidate 从未使用，优先
+
 		return true
 	case candidate.LastUsedAt != nil && current.LastUsedAt == nil:
-		// current 从未使用，保持
+
 		return false
 	case candidate.LastUsedAt == nil && current.LastUsedAt == nil:
-		// 都未使用，保持
+
 		return false
 	default:
-		// 都使用过，选择最久未使用的
+
 		return candidate.LastUsedAt.Before(*current.LastUsedAt)
 	}
 }
 
-// SelectAccountWithLoadAwareness selects an account with load-awareness and wait plan.
 func (s *OpenAIGatewayService) SelectAccountWithLoadAwareness(ctx context.Context, groupID *int64, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}) (*AccountSelectionResult, error) {
 	ctx = s.withOpenAIQuotaAutoPauseContext(ctx)
 	ctx = s.withOpenAIGroupPrivacyRequirement(ctx, groupID)
-	// 分组利润控制：legacy 公共入口同样装门，保证不经
-	// selectAccountWithScheduler 的调用方也无法绕过利润准入。
+
 	ctx = s.withOpenAIProfitControlGate(ctx, groupID)
 	return s.selectAccountWithLoadAwareness(ctx, groupID, PlatformOpenAI, sessionHash, requestedModel, excludedIDs, false, "", true)
 }
@@ -1205,11 +1039,6 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		return excluded
 	}
 
-	// ============ Layer 1: Sticky session ============
-	// A healthy sticky account whose bounded wait queue is full may be used as a
-	// one-request capacity spillover in Layer 2. Keep that spillover temporary:
-	// rewriting the durable binding here would make a short burst migrate the
-	// whole conversation to a cache-cold account.
 	stickySpillover := false
 	if sessionHash != "" {
 		accountID := stickyAccountID
@@ -1260,9 +1089,6 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		}
 	}
 
-	// ============ Layer 2: Load-aware selection ============
-	// Per-pass parent-health cache to avoid repeated DB calls when multiple shadow
-	// accounts share the same parent.
 	parentCacheL2 := make(map[int64]*Account)
 	parentLookupL2 := func(id int64) *Account {
 		if a, ok := parentCacheL2[id]; ok {
@@ -1284,9 +1110,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 			filterStats.exclude("excluded")
 			continue
 		}
-		// Scheduler snapshots can be temporarily stale (bucket rebuild is throttled);
-		// re-check schedulability here so recently rate-limited/overloaded accounts
-		// are not selected again before the bucket is rebuilt.
+
 		if reason := openAICompatibleAccountEligibilityFailureReason(ctx, acc, platform, requestedModel, false, requiredCapability); reason != "" {
 			filterStats.exclude(reason)
 			continue
@@ -1380,8 +1204,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 			}
 			selectionOrder = appendTier(selectionOrder, 2)
 			selectionOrder = appendTier(selectionOrder, 1)
-			// tier 0 候选作为兜底追加：DB recheck 时若发现 cache tier 0 实际
-			// 已升级为 1/2（探测刚跑完，cache 尚未刷新），仍可正常命中。
+
 			selectionOrder = appendTier(selectionOrder, 0)
 		} else {
 			selectionOrder = append(selectionOrder, available...)
@@ -1466,7 +1289,6 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		}
 	}
 
-	// ============ Layer 3: Fallback wait ============
 	sortAccountsByPriorityAndLastUsed(candidates, false)
 	if rateOrder.enabled {
 		sort.SliceStable(candidates, func(i, j int) bool {
@@ -1585,10 +1407,6 @@ func (s *OpenAIGatewayService) resolveFreshSchedulableOpenAIAccountBeforeProfit(
 	return fresh
 }
 
-// parentAccountLookup 返回供 parentHealthyForShadow 使用的母账号解析闭包:经 accountRepo
-// 按 ID 取当前 Account(repo 为空时 fail-closed 返回 nil)。统一调度/粘连各路径的母账号解析,
-// 取代各调用点重复内联的同一闭包(历史上 recheck 等路径还漏写过 accountRepo==nil 守卫)。
-// L2 候选循环改用带 per-pass 缓存的 parentLookupL2,不走此方法。
 func (s *OpenAIGatewayService) parentAccountLookup(ctx context.Context) func(int64) *Account {
 	return func(id int64) *Account {
 		if s.accountRepo == nil {
@@ -1685,7 +1503,7 @@ func (s *OpenAIGatewayService) getSchedulableAccount(ctx context.Context, accoun
 	if s.isOpenAIAccountBlockedBySchedulingThreshold(ctx, account) {
 		return nil, nil
 	}
-	// Legacy sticky (advanced scheduler off) must still free-gate Grok OAuth.
+
 	if account.IsGrok() {
 		if gated := s.filterGrokFreeQuotaAccountsForOpenAI(ctx, []Account{*account}); len(gated) == 0 {
 			return nil, nil
@@ -1694,8 +1512,6 @@ func (s *OpenAIGatewayService) getSchedulableAccount(ctx context.Context, accoun
 	return account, nil
 }
 
-// filterGrokFreeQuotaAccountsForOpenAI applies the same local free soft-gate as
-// GatewayService / advanced scheduler, for OpenAI-compatible legacy selection.
 func (s *OpenAIGatewayService) filterGrokFreeQuotaAccountsForOpenAI(ctx context.Context, accounts []Account) []Account {
 	if s == nil {
 		return accounts
@@ -1760,7 +1576,6 @@ func (s *OpenAIGatewayService) newAcquiredSelectionResult(ctx context.Context, a
 	return selection, err
 }
 
-// markStickySessionHit 在选号结果上记录账号是否来自会话粘性命中。
 func markStickySessionHit(selection *AccountSelectionResult, hit bool) *AccountSelectionResult {
 	if selection != nil && hit {
 		selection.stickySessionHit = true

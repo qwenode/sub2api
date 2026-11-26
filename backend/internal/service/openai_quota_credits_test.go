@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -40,7 +41,7 @@ func TestQueryUsageCodexCredits(t *testing.T) {
 					_, _ = w.Write([]byte(tc.body))
 					return
 				}
-				// Reset-card details may be unavailable without losing points.
+
 				http.Error(w, "unavailable", http.StatusServiceUnavailable)
 			}))
 			defer srv.Close()
@@ -53,6 +54,17 @@ func TestQueryUsageCodexCredits(t *testing.T) {
 			require.JSONEq(t, tc.want, string(encoded))
 			require.Equal(t, []string{"/backend-api/wham/usage", "/backend-api/wham/rate-limit-reset-credits"}, paths)
 			require.Zero(t, repo.extraUpdateCalls, "read-only query must not write account state")
+			paths = nil
+			before := time.Now().UnixMilli()
+			creditsUsage, err := svc.QueryCreditsUsage(context.Background(), 100)
+			require.NoError(t, err)
+			require.GreaterOrEqual(t, creditsUsage.CreditsObservedAtMs, before)
+			require.LessOrEqual(t, creditsUsage.CreditsObservedAtMs, time.Now().UnixMilli())
+			encoded, err = json.Marshal(creditsUsage.Credits)
+			require.NoError(t, err)
+			require.JSONEq(t, tc.want, string(encoded))
+			require.Equal(t, []string{"/backend-api/wham/usage"}, paths)
+			require.Zero(t, repo.extraUpdateCalls)
 		})
 	}
 }
@@ -64,7 +76,6 @@ func TestCacheCodexCreditsSnapshot(t *testing.T) {
 	balance := "1200.50"
 	usage := &OpenAIQuotaUsage{FetchedAt: 123, Credits: &OpenAICredits{HasCredits: true, Balance: &balance}}
 
-	// No reset-card details are required to persist the balance on the queried row.
 	require.NoError(t, svc.CacheCreditsSnapshot(ctx, 200, usage))
 	encoded, err := json.Marshal(repo.extraUpdates[200][openaiQuotaCreditsKey])
 	require.NoError(t, err)
@@ -72,7 +83,6 @@ func TestCacheCodexCreditsSnapshot(t *testing.T) {
 	require.NotContains(t, repo.extraUpdates, int64(100), "a shadow row must not overwrite its parent")
 	require.NotContains(t, repo.extraUpdates[200], openaiQuotaResetCreditsKey)
 
-	// Missing credits from a successful read invalidate the previous balance.
 	require.NoError(t, svc.CacheCreditsSnapshot(ctx, 200, &OpenAIQuotaUsage{FetchedAt: 456}))
 	encoded, err = json.Marshal(repo.extraUpdates[200][openaiQuotaCreditsKey])
 	require.NoError(t, err)
