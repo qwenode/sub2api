@@ -1,7 +1,7 @@
 .PHONY: build build-backend build-frontend test test-backend test-frontend test-frontend-critical
 
 FRONTEND_CRITICAL_VITEST := \
-	src/i18n/__tests__/localeKeyCompleteness.spec.ts \
+	src/i18n/__tests__ \
 	src/api/__tests__/client.spec.ts \
 	src/api/__tests__/tokenRefresh.spec.ts \
 	src/api/__tests__/keys.bulkUpdate.spec.ts \
@@ -40,7 +40,7 @@ build: build-backend build-frontend
 build-backend:
 	@$(MAKE) -C backend build
 
-# 编译前端（需要已安装依赖）
+# 按锁文件安装依赖后编译前端
 build-frontend:
 	@pnpm --dir frontend run build
 
